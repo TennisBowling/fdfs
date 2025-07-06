@@ -1,7 +1,7 @@
 use std::{error::Error, sync::atomic::AtomicUsize, time::Instant};
 use gxhash::{gxhash64};
 use shared::*;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, stream, sync::Mutex};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex};
 use tracing_subscriber::EnvFilter;
 
 pub fn path_to_inode(str: &str) -> Inode {
