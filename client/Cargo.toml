@@ -1,0 +1,12 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+tokio = { workspace = true }
+gxhash = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bitcode = { workspace = true }
