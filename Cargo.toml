@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "shared",
+    "storage", 
+    "client"
+]
+resolver = "3"
+
+[workspace.dependencies]
+tokio = { version = "1.46.1", features = ["full"] }
+#serde = { version = "v1.0.219", features = ["derive"] }
+bitcode = "0.6.6"
+gxhash = "3.5.0"
+tracing = "0.1.4"
+tracing-subscriber = {version = "0.3.18", features = ["env-filter"]}
+
+
+[profile.highperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+incremental = false
