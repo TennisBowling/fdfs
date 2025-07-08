@@ -1,8 +1,50 @@
 use std::{error::Error, io::ErrorKind};
 use shared::*;
 use tracing_subscriber::EnvFilter;
-use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}, net::{TcpListener, TcpStream}};
+use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}, net::{TcpListener, TcpStream}};
 
+async fn handle_create(device: &str, inode: Inode, parent_inode: Inode, name: String, is_dir: bool) -> OpResponse {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("{}dino{}", device, parent_inode.0))
+        .await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Error opening file to write to parent node {:?} inode {:?}: {}", parent_inode, inode, e);
+                return OpResponse::Error(format!("{}", e));
+            }
+        };
+
+
+    let file_len = file.metadata().await.unwrap().len() as usize;
+    let mut buf = vec![0u8; file_len];
+    file.read_exact(&mut buf).await.unwrap();
+    let mut entries: Vec<Entry> = bitcode::decode(&buf).unwrap();
+    
+    for entry in entries.iter() {
+        if entry.inode.0 == inode.0 {
+            return OpResponse::Error("File already exists".to_string());
+        }
+    }
+
+    // Add the new file to the list of files that the directory contains
+    entries.push(Entry { name, inode, is_dir });
+
+    file.set_len(0).await.unwrap();
+    file.seek(SeekFrom::Start(0)).await.unwrap();
+    file.write_all(&bitcode::encode(&entries)).await.unwrap();
+
+    if is_dir {
+        // Just to be careful, create_new will return an error if one already exists and create will truncate
+        File::create_new(format!("{}dino{}", device, inode.0)).await.unwrap();
+    }
+    else {
+        File::create_new(format!("{}ino{}", device, inode.0)).await.unwrap();
+    }
+
+    OpResponse::CreateOk
+}
 
 async fn handle_write(device: &str, inode: Inode, offset: u64, data: Vec<u8>) -> OpResponse {
     let mut file = match tokio::fs::OpenOptions::new()
@@ -60,6 +102,17 @@ async fn handle_read(device: &str, inode: Inode, offset: u64, size: u64) -> OpRe
     OpResponse::ReadData(buf)
 }
 
+#[inline]
+async fn send_response(mut stream: TcpStream, payload: OpResponse) -> Result<(), Box<dyn Error>> {
+    let serialized = bitcode::encode(&payload);
+    let mut buf = Vec::with_capacity(8 + serialized.len());     // Write size and then the payload
+    buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&serialized);
+    stream.write_all(&buf).await?;
+
+    Ok(())
+}
+
 async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
     tracing::debug!("Client connected");
 
@@ -75,34 +128,29 @@ async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<
             Op::Write { inode, offset, data } => {
                 tracing::debug!("Write op from client");
                 let payload = handle_write(&device, inode, offset, data).await;
-
-
-                let serialized = bitcode::encode(&payload);
-                let mut buf = Vec::with_capacity(8 + serialized.len());     // Write size and then the payload
-                buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
-                buf.extend_from_slice(&serialized);
-                stream.write_all(&buf).await?;
+                
+                send_response(stream, payload).await?;
                 tracing::debug!("Wrote write response to client");
             },
             Op::Read { inode, offset, size } => {
                 tracing::debug!("Read op from client");
                 let payload = handle_read(&device, inode, offset, size).await;
 
-                let serialized = bitcode::encode(&payload);
-                let mut buf = Vec::with_capacity(8 + serialized.len());     // Write size and then the payload
-                buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
-                buf.extend_from_slice(&serialized);
-                stream.write_all(&buf).await?;
+                send_response(stream, payload).await?;
                 tracing::debug!("Wrote read response to client");
+            },
+            Op::Create { inode, parent_inode, name, is_dir } => {
+                tracing::debug!("Create op from client");
+                let payload = handle_create(device, inode, parent_inode, name, is_dir).await;
+
+                send_response(stream, payload).await;
+                tracing::debug!("Wrote create response to client");
             },
             Op::Other(str) => {
                 tracing::info!("Other message from client: {}", str);
                 let payload = OpResponse::Error("hey man - storage server".to_string());
-                let serialized = bitcode::encode(&payload);
-                let mut buf = Vec::with_capacity(8 + serialized.len());     // Write size and then the payload
-                buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
-                buf.extend_from_slice(&serialized);
-                stream.write_all(&buf).await?;
+
+                send_response(stream, payload).await?;
                 tracing::debug!("Wrote payload response to client");
             },
         }

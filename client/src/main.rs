@@ -1,7 +1,11 @@
-use std::{error::Error, sync::atomic::AtomicUsize, time::Instant};
-use gxhash::{gxhash64};
+use gxhash::gxhash64;
 use shared::*;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, sync::Mutex};
+use std::{error::Error, sync::atomic::AtomicUsize, time::Instant};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::Mutex,
+};
 use tracing_subscriber::EnvFilter;
 
 pub fn path_to_inode(str: &str) -> Inode {
@@ -15,32 +19,40 @@ struct NodeConnectionManager {
 }
 
 impl NodeConnectionManager {
-    async fn new(addr: String, num_connections: u32) -> Result<NodeConnectionManager, Box<dyn Error>> {
+    async fn new(
+        addr: String,
+        num_connections: u32,
+    ) -> Result<NodeConnectionManager, Box<dyn Error>> {
         let mut streams = Vec::with_capacity(num_connections as usize);
 
         for _ in 0..num_connections {
             let stream = TcpStream::connect(addr.clone()).await?;
-            stream.set_nodelay(true)?;   // Disable nagle, do not buffer
-            streams.push(Mutex::new((stream, Vec::with_capacity(1000000))));     // 1MB buffer
-
+            stream.set_nodelay(true)?; // Disable nagle, do not buffer
+            streams.push(Mutex::new((stream, Vec::with_capacity(1000000)))); // 1MB buffer
         }
 
         tracing::debug!("Setup connection maanger for node {}", addr);
-        Ok(NodeConnectionManager { streams, current: AtomicUsize::new(0), addr })
+        Ok(NodeConnectionManager {
+            streams,
+            current: AtomicUsize::new(0),
+            addr,
+        })
     }
 
     async fn send_request(&self, payload: Op) -> Result<OpResponse, Box<dyn Error>> {
-        let stream_id = self.current.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.streams.len();
+        let stream_id = self
+            .current
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.streams.len();
         let mut stream_buf = self.streams.get(stream_id).unwrap().lock().await;
         let (stream, buf) = &mut *stream_buf;
 
         let serialized = bitcode::encode(&payload);
-        buf.clear();       // Reuse buffer
-        buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes());    // Write size and then the payload
+        buf.clear(); // Reuse buffer
+        buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes()); // Write size and then the payload
         buf.extend_from_slice(&serialized);
         stream.write_all(&buf).await?;
         tracing::debug!("Wrote payload to {}", self.addr);
-
 
         let cap = stream.read_u64_le().await?;
         let mut buf = vec![0u8; cap as usize];
@@ -51,7 +63,6 @@ impl NodeConnectionManager {
     }
 }
 
-
 struct NodeManager {
     pub nodes: Vec<NodeConnectionManager>,
 }
@@ -60,20 +71,17 @@ impl NodeManager {
     async fn new(nodes_strings: Vec<String>) -> Result<NodeManager, Box<dyn Error>> {
         let mut nodes = Vec::with_capacity(nodes_strings.len());
         for node in nodes_strings {
-            nodes.push(NodeConnectionManager::new(node, 1).await?);  // 100 max connections
+            nodes.push(NodeConnectionManager::new(node, 1).await?); // 100 max connections
         }
 
         Ok(NodeManager { nodes })
     }
-    
+
     pub fn inode_to_server(&self, inode: Inode) -> &NodeConnectionManager {
         let server_index = inode.0 as usize % self.nodes.len();
         self.nodes.get(server_index).unwrap()
     }
 }
-
-
-
 
 #[tokio::main]
 async fn main() {
@@ -89,15 +97,54 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     tracing::info!("Starting fdfs client");
 
-    let manager = NodeManager::new(vec!["127.0.0.1:10000".to_string()]).await.unwrap();
-    
+    let manager = NodeManager::new(vec!["127.0.0.1:10000".to_string()])
+        .await
+        .unwrap();
+
     let inode = path_to_inode("/test/test.txt");
     let server = manager.inode_to_server(inode);
-    let resp = server.send_request(Op::Other("hey client!!!!!!!!!".to_string())).await.unwrap();
+    let resp = server
+        .send_request(Op::Other("hey client!!!!!!!!!".to_string()))
+        .await
+        .unwrap();
     tracing::info!("response from storage server: {:?}", resp);
 
     let start = Instant::now();
-    let resp = server.send_request(Op::Other("timing check".to_string())).await.unwrap();
+    let resp = server
+        .send_request(Op::Other("timing check".to_string()))
+        .await
+        .unwrap();
     let end = start.elapsed().as_secs_f32();
-    tracing::info!("response from storage server again: {:?}, in {}s", resp, end);
+    tracing::info!(
+        "response from storage server again: {:?}, in {}s",
+        resp,
+        end
+    );
+
+    let resp = server
+        .send_request(Op::Write {
+            inode: Inode(1),
+            offset: 0,
+            data: "i love you aanchal".as_bytes().to_vec(),
+        })
+        .await
+        .unwrap();
+    tracing::info!("Response from storage server for write: {:?}", resp);
+
+    let resp = server
+        .send_request(Op::Read {
+            inode: Inode(1),
+            offset: 0,
+            size: 18,
+        })
+        .await
+        .unwrap();
+    tracing::info!("Response from storage server for read: {:?}", resp);
+    match resp {
+        OpResponse::WriteOk => {}
+        OpResponse::ReadData(data) => {
+            tracing::info!("Decoded: {}", str::from_utf8(&data).unwrap());
+        }
+        OpResponse::Error(_) => {}
+    }
 }
