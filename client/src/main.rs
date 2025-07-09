@@ -141,10 +141,9 @@ async fn main() {
         .unwrap();
     tracing::info!("Response from storage server for read: {:?}", resp);
     match resp {
-        OpResponse::WriteOk => {}
         OpResponse::ReadData(data) => {
             tracing::info!("Decoded: {}", str::from_utf8(&data).unwrap());
         }
-        OpResponse::Error(_) => {}
+        _ => {}
     }
 }
