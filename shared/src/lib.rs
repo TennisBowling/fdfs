@@ -31,6 +31,7 @@ pub enum Op {
     },
     Delete {
         inode: Inode,
+        parent_inode: Inode,
     },
     GetSize {
         inode: Inode,
@@ -54,7 +55,11 @@ pub enum Op {
 pub enum OpResponse {
     WriteOk,
     ReadData(Vec<u8>),
+    CreateOk,
+    DeleteOk,
+    SizeData(u64),
+    CreateDirOk,
+    DeleteDirOk,
+    ListDirData(Vec<Entry>),
     Error(String),
-
-    CreateOk
 }
