@@ -1,4 +1,4 @@
-use std::{error::Error, io::ErrorKind, ops::Index};
+use std::{error::Error, io::ErrorKind};
 use shared::*;
 use tracing_subscriber::EnvFilter;
 use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}, net::{TcpListener, TcpStream}};
@@ -53,7 +53,7 @@ async fn handle_write(device: &str, inode: Inode, offset: u64, data: Vec<u8>) ->
         .open(format!("{}ino{}", device, inode.0)).await {   // /mnt/ssd/ino100
             Ok(f) => f,
             Err(e) => {
-                return OpResponse::Error(format!("{}", e));
+                return OpResponse::Error(format!("Write error: {}", e));
             }
         };
 
@@ -102,8 +102,14 @@ async fn handle_read(device: &str, inode: Inode, offset: u64, size: u64) -> OpRe
     OpResponse::ReadData(buf)
 }
 
-async fn handle_delete(device: &str, inode: Inode, parent_inode: Inode) -> OpResponse {
-    tokio::fs::remove_file(format!("{}ino{}", device, inode.0)).await.unwrap();
+async fn handle_delete(device: &str, inode: Inode, parent_inode: Inode, is_dir: bool) -> OpResponse {
+    if is_dir {
+        tokio::fs::remove_file(format!("{}dino{}", device, inode.0)).await.unwrap();
+    }
+    else {
+        tokio::fs::remove_file(format!("{}ino{}", device, inode.0)).await.unwrap();
+    }
+
 
     let mut file = match tokio::fs::OpenOptions::new()
         .read(true)
@@ -112,7 +118,7 @@ async fn handle_delete(device: &str, inode: Inode, parent_inode: Inode) -> OpRes
         .await {
             Ok(f) => f,
             Err(e) => {
-                tracing::error!("Error opening file to write to parent node {:?} inode {:?}: {}", parent_inode, inode, e);
+                tracing::error!("Error opening file to write to parent node {:?} the deletion of inode {:?}: {}", parent_inode, inode, e);
                 return OpResponse::Error(format!("{}", e));
             }
         };
@@ -143,8 +149,44 @@ async fn handle_delete(device: &str, inode: Inode, parent_inode: Inode) -> OpRes
     OpResponse::DeleteOk
 }
 
+async fn handle_getsize(device: &str, inode: Inode) -> OpResponse {
+    let file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(format!("{}ino{}", device, inode.0)).await {
+            Ok(f) => f,
+            Err(e) => {
+                return OpResponse::Error(format!("Error opening file to get size: {}", e));
+            }
+        };
+
+
+    OpResponse::SizeData(file.metadata().await.unwrap().len())
+}
+
+async fn handle_listdirentries(device: &str, inode: Inode) -> OpResponse {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("{}dino{}", device, inode.0))
+        .await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Error opening dir file to get entries {:?}: {}", inode, e);
+                return OpResponse::Error(format!("{}", e));
+            }
+        };
+
+    let file_len = file.metadata().await.unwrap().len() as usize;
+    let mut buf = vec![0u8; file_len];
+    file.read_exact(&mut buf).await.unwrap();
+    let entries: Vec<Entry> = bitcode::decode(&buf).unwrap();
+
+    OpResponse::ListDirData(entries)
+}
+
 #[inline]
-async fn send_response(mut stream: TcpStream, payload: OpResponse) -> Result<(), Box<dyn Error>> {
+async fn send_response(stream: &mut TcpStream, payload: OpResponse) -> Result<(), Box<dyn Error>> {
     let serialized = bitcode::encode(&payload);
     let mut buf = Vec::with_capacity(8 + serialized.len());     // Write size and then the payload
     buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
@@ -170,35 +212,49 @@ async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<
                 tracing::debug!("Write op from client");
                 let payload = handle_write(&device, inode, offset, data).await;
                 
-                send_response(stream, payload).await?;
+                send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote write response to client");
             },
             Op::Read { inode, offset, size } => {
                 tracing::debug!("Read op from client");
                 let payload = handle_read(&device, inode, offset, size).await;
 
-                send_response(stream, payload).await?;
+                send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote read response to client");
             },
             Op::Create { inode, parent_inode, name, is_dir } => {
                 tracing::debug!("Create op from client");
                 let payload = handle_create(&device, inode, parent_inode, name, is_dir).await;
 
-                send_response(stream, payload).await;
+                send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote create response to client");
             },
-            Op::Delete { inode } -> {
+            Op::Delete { inode, parent_inode, is_dir } => {
                 tracing::debug!("Delete op from client");
-                let payload = handle_delete(&device, inode, parent_inode).await;
+                let payload = handle_delete(&device, inode, parent_inode, is_dir).await;
 
-                send_response(stream, payload).await;
+                send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote delete response to client");
+            }
+            Op::GetSize { inode } => {
+                tracing::debug!("GetSize op from client");
+                let payload = handle_getsize(&device, inode).await;
+
+                send_response(&mut stream, payload).await?;
+                tracing::debug!("Wrote getsize response to client");
+            }
+            Op::ListDirEntries { inode } => {
+                tracing::debug!("ListDirEntries op from client");
+                let payload = handle_listdirentries(&device, inode).await;
+
+                send_response(&mut stream, payload).await?;
+                tracing::debug!("Wrote listdirentries response to client");
             }
             Op::Other(str) => {
                 tracing::info!("Other message from client: {}", str);
                 let payload = OpResponse::Error("hey man - storage server".to_string());
 
-                send_response(stream, payload).await?;
+                send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote payload response to client");
             },
         }
