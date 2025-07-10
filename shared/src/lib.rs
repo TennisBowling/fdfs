@@ -32,18 +32,13 @@ pub enum Op {
     Delete {
         inode: Inode,
         parent_inode: Inode,
+        is_dir: bool,
     },
     GetSize {
         inode: Inode,
     },
 
     // Directory ops
-    CreateDir {
-        inode: Inode,
-    },
-    DeleteDir {
-        inode: Inode,
-    },
     ListDirEntries {
         inode: Inode,
     },
@@ -58,8 +53,6 @@ pub enum OpResponse {
     CreateOk,
     DeleteOk,
     SizeData(u64),
-    CreateDirOk,
-    DeleteDirOk,
     ListDirData(Vec<Entry>),
     Error(String),
 }
