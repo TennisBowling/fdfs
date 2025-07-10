@@ -1,4 +1,4 @@
-use std::{error::Error, io::ErrorKind};
+use std::{error::Error, io::ErrorKind, ops::Index};
 use shared::*;
 use tracing_subscriber::EnvFilter;
 use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}, net::{TcpListener, TcpStream}};
@@ -123,11 +123,22 @@ async fn handle_delete(device: &str, inode: Inode, parent_inode: Inode) -> OpRes
     file.read_exact(&mut buf).await.unwrap();
     let mut entries: Vec<Entry> = bitcode::decode(&buf).unwrap();
     
-    for entry in entries.iter() {
+    let mut idx = 0;
+    for (index, entry) in entries.iter().enumerate() {
         if entry.inode.0 == inode.0 {
-            
+            idx = index;
         }
     }
+
+    if idx == 0 {
+        return OpResponse::Error("Unable to find entry in directory".to_string());
+    }
+    
+    entries.remove(idx);    // Remove from the entries and then rewrite all the entries to the file
+
+    file.set_len(0).await.unwrap();
+    file.seek(SeekFrom::Start(0)).await.unwrap();
+    file.write_all(&bitcode::encode(&entries)).await.unwrap();
 
     OpResponse::DeleteOk
 }
