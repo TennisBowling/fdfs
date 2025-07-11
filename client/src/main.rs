@@ -71,7 +71,7 @@ impl NodeManager {
     async fn new(nodes_strings: Vec<String>) -> Result<NodeManager, Box<dyn Error>> {
         let mut nodes = Vec::with_capacity(nodes_strings.len());
         for node in nodes_strings {
-            nodes.push(NodeConnectionManager::new(node, 1).await?); // 100 max connections
+            nodes.push(NodeConnectionManager::new(node, 5).await?); // 100 max connections
         }
 
         Ok(NodeManager { nodes })
@@ -97,7 +97,7 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     tracing::info!("Starting fdfs client");
 
-    let manager = NodeManager::new(vec!["127.0.0.1:10000".to_string()])
+    let manager = NodeManager::new(vec!["127.0.0.1:10000".to_string(), "127.0.0.1:10001".to_string()])
         .await
         .unwrap();
 
@@ -109,41 +109,62 @@ async fn main() {
         .unwrap();
     tracing::info!("response from storage server: {:?}", resp);
 
-    let start = Instant::now();
-    let resp = server
-        .send_request(Op::Other("timing check".to_string()))
-        .await
-        .unwrap();
-    let end = start.elapsed().as_secs_f32();
-    tracing::info!(
-        "response from storage server again: {:?}, in {}s",
-        resp,
-        end
-    );
+    
+    /*
+    We're going to
+    - Create a directory
+    - Create a file
+    - Write to the file
+    - List files inside the directory
+    - Read the size of the file
+    - Read the file
+    - Delete the file
+    - Delete the directory
+    This covers all of the enumerations of Op */
+    tracing::debug!("Creating directory");
+    let resp = server.send_request(Op::Create { inode: Inode(2), parent_inode: Inode(1), name: "directory".to_string(), is_dir: true }).await.unwrap();
+    tracing::info!("Response: {:?}", resp);
 
-    let resp = server
-        .send_request(Op::Write {
-            inode: Inode(1),
-            offset: 0,
-            data: "i love you aanchal".as_bytes().to_vec(),
-        })
-        .await
-        .unwrap();
-    tracing::info!("Response from storage server for write: {:?}", resp);
+    tracing::debug!("Creating test file inside directory");
+    let resp = server.send_request(Op::Create { inode: Inode(3), parent_inode: Inode(2), name: "testfile".to_string(), is_dir: false }).await.unwrap();
+    tracing::info!("Response: {:?}", resp);
 
-    let resp = server
-        .send_request(Op::Read {
-            inode: Inode(1),
-            offset: 0,
-            size: 18,
-        })
-        .await
-        .unwrap();
-    tracing::info!("Response from storage server for read: {:?}", resp);
-    match resp {
-        OpResponse::ReadData(data) => {
-            tracing::info!("Decoded: {}", str::from_utf8(&data).unwrap());
+    tracing::debug!("Writing to test file");
+    let resp = server.send_request(Op::Write { inode: Inode(3), offset: 0, data: "hi ab!".as_bytes().to_vec() }).await.unwrap();
+    tracing::info!("Response: {:?}", resp);
+
+    tracing::debug!("Listing files inside the directory");
+    let resp = server.send_request(Op::ListDirEntries { inode: Inode(2) }).await.unwrap();
+    tracing::info!("Response: {:?}", resp);
+
+    tracing::debug!("Reading size of file");
+    let resp = server.send_request(Op::GetSize { inode: Inode(3) }).await.unwrap();
+    let size = match resp {
+        OpResponse::SizeData(s) => s,
+        _ => {
+            tracing::error!("wrong thing read");
+            return;
         }
-        _ => {}
-    }
+    };
+    tracing::info!("Response: {:?}, size: {}", resp, size);
+
+    tracing::debug!("Reading the file with the size obtained");
+    let resp = server.send_request(Op::Read { inode: Inode(3), offset: 0, size: size }).await.unwrap();
+    let str = String::from_utf8(match resp {
+        OpResponse::ReadData(ref v) => v.to_vec(),
+        _ => {
+            tracing::error!("wrong thing read");
+            return;
+        }
+    }).unwrap();
+    tracing::info!("Response: {:?}, decoded: {}", resp, str);
+
+    tracing::debug!("Deleting the file");
+    let resp = server.send_request(Op::Delete { inode: Inode(3), parent_inode: Inode(2), is_dir: false }).await.unwrap();
+    tracing::info!("Response: {:?}", resp);
+
+    tracing::debug!("Deleting the directory");
+    let resp = server.send_request(Op::Delete { inode: Inode(2), parent_inode: Inode(1), is_dir: true }).await.unwrap();
+    tracing::info!("Response: {:?}", resp);
+
 }
