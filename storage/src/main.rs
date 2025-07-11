@@ -3,6 +3,12 @@ use shared::*;
 use tracing_subscriber::EnvFilter;
 use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}, net::{TcpListener, TcpStream}};
 
+
+async fn create_empty_entries(mut file: File) {
+    let entries: Vec<Entry> = Vec::new();
+    file.write_all(&bitcode::encode(&entries)).await.unwrap();
+}
+
 async fn handle_create(device: &str, inode: Inode, parent_inode: Inode, name: String, is_dir: bool) -> OpResponse {
     let mut file = match tokio::fs::OpenOptions::new()
         .read(true)
@@ -37,7 +43,8 @@ async fn handle_create(device: &str, inode: Inode, parent_inode: Inode, name: St
 
     if is_dir {
         // Just to be careful, create_new will return an error if one already exists and create will truncate
-        File::create_new(format!("{}dino{}", device, inode.0)).await.unwrap();
+        let file = File::create_new(format!("{}dino{}", device, inode.0)).await.unwrap();
+        create_empty_entries(file).await;
     }
     else {
         File::create_new(format!("{}ino{}", device, inode.0)).await.unwrap();
@@ -49,7 +56,6 @@ async fn handle_create(device: &str, inode: Inode, parent_inode: Inode, name: St
 async fn handle_write(device: &str, inode: Inode, offset: u64, data: Vec<u8>) -> OpResponse {
     let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
-        .create(true)
         .open(format!("{}ino{}", device, inode.0)).await {   // /mnt/ssd/ino100
             Ok(f) => f,
             Err(e) => {
@@ -129,18 +135,18 @@ async fn handle_delete(device: &str, inode: Inode, parent_inode: Inode, is_dir: 
     file.read_exact(&mut buf).await.unwrap();
     let mut entries: Vec<Entry> = bitcode::decode(&buf).unwrap();
     
-    let mut idx = 0;
+    let mut idx: Option<usize> = None;
     for (index, entry) in entries.iter().enumerate() {
         if entry.inode.0 == inode.0 {
-            idx = index;
+            idx = Some(index);
         }
     }
 
-    if idx == 0 {
+    if idx == None {
         return OpResponse::Error("Unable to find entry in directory".to_string());
     }
     
-    entries.remove(idx);    // Remove from the entries and then rewrite all the entries to the file
+    entries.remove(idx.unwrap());    // Remove from the entries and then rewrite all the entries to the file
 
     file.set_len(0).await.unwrap();
     file.seek(SeekFrom::Start(0)).await.unwrap();
@@ -278,9 +284,24 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     tracing::info!("Starting fdfs storage server");
 
-    let listener = TcpListener::bind("0.0.0.0:10000").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:10001").await.unwrap();
 
     let device = "./".to_string();
+
+    // Initialize special directory inode 1
+    match File::create_new(format!("{}dino1", device)).await {
+        Ok(file) => {
+            tracing::info!("Creating special directory inode 1");
+            create_empty_entries(file).await;
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                tracing::debug!("No need to create special directory inode 1");
+            } else {
+                tracing::info!("Error creating special directory inode 1: {}", e);
+            }
+        }
+    }
 
     loop {
         let (stream, _) = listener.accept().await.unwrap();
