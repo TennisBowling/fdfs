@@ -1,6 +1,6 @@
 use gxhash::gxhash64;
 use shared::*;
-use std::{error::Error, os::unix::ffi::OsStrExt, path::{self, Path}, sync::atomic::AtomicUsize};
+use std::{error::Error, os::unix::ffi::OsStrExt, path::Path, sync::atomic::AtomicUsize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -194,7 +194,36 @@ impl NodeManager {
 
 #[tokio::main]
 async fn main() {
-    let log_level = "debug";
+    let matches = clap::App::new("fdfs-client")
+        .version("0.0.1")
+        .author("TennisBowling <tennisbowling@tennisbowling.com>")
+        .setting(clap::AppSettings::ColoredHelp)
+        .about("The client for fdfs, the Fast Distributed File System written in Rust")
+        .long_version("fdfs version {} by TennisBowling <tennisbowling@tennisbowling.com>")
+        .arg(
+            clap::Arg::with_name("nodes")
+                .short("n")
+                .long("nodes")
+                .value_name("NODES")
+                .help("Comma-separated list of storage node addresses to use")
+                .takes_value(true)
+                .required(true),
+        )
+        .arg(
+            clap::Arg::with_name("log-level")
+                .short("l")
+                .long("log-level")
+                .value_name("LOG")
+                .help("Log level: debug, info, warn, crit")
+                .takes_value(true)
+                .default_value("debug"),
+        )
+        .get_matches();
+    
+    let log_level = matches.value_of("log-level").unwrap();
+    let nodes = matches.value_of("nodes").unwrap();
+    let nodes = nodes.split(',').collect::<Vec<&str>>().iter().map(|x| x.to_string()).collect();
+
     let filter_string = format!("{},hyper=info", log_level);
 
     let filter = EnvFilter::try_new(filter_string).unwrap_or_else(|_| EnvFilter::new(log_level));
@@ -206,7 +235,7 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     tracing::info!("Starting fdfs client");
 
-    let manager = NodeManager::new(vec!["127.0.0.1:10000".to_string()])
+    let manager = NodeManager::new(nodes)
         .await
         .unwrap();
 
@@ -214,60 +243,184 @@ async fn main() {
     manager.create_special().await.unwrap();
     
     /*
-    We're going to
-    - Create a directory
-    - Create a file
-    - Write to the file
-    - List files inside the directory
-    - Read the size of the file
-    - Read the file
-    - Delete the file
-    - Delete the directory
-    This covers all of the enumerations of Op */
-    tracing::debug!("Creating directory");
-    let resp = manager.create(Path::new("/directory"), true).await;
-    tracing::info!("Response: {:?}", resp);
+    Comprehensive filesystem manager test:
+    - Create nested directory structure
+    - Create multiple files with different content
+    - Write to all files
+    - Read back and verify content
+    - Clean up everything
+    This covers all of the enumerations of Op with extensive testing */
 
-    tracing::debug!("Creating test file inside directory");
-    let resp = manager.create(Path::new("/directory/testfile"), false).await;
-    tracing::info!("Response: {:?}", resp);
+    // Test data for our files
+    let test_files = vec![
+        ("/root_dir/file1.txt", "Hello World!"),
+        ("/root_dir/file2.txt", "This is test file number 2 with more content."),
+        ("/root_dir/subdir1/nested_file1.txt", "Nested file content here."),
+        ("/root_dir/subdir1/nested_file2.txt", "Another nested file with different data."),
+        ("/root_dir/subdir1/deep/deeper/deepest_file.txt", "Very deep nested file content!"),
+        ("/root_dir/subdir2/config.txt", "configuration=test\nvalue=42\nstatus=active"),
+        ("/root_dir/subdir2/data.txt", "1,2,3,4,5\na,b,c,d,e\ntest,data,here"),
+        ("/root_dir/subdir2/logs/app.log", "2025-01-01 12:00:00 INFO: Application started"),
+        ("/root_dir/subdir2/logs/error.log", "2025-01-01 12:01:00 ERROR: Something went wrong"),
+        ("/root_dir/temp/temp_file.tmp", "Temporary file content for testing"),
+    ];
 
-    tracing::debug!("Writing to test file");
-    let resp = manager.write(Path::new("/directory/testfile"), 0, "hi ab!".as_bytes().to_vec()).await;
-    tracing::info!("Response: {:?}", resp);
+    // Directories to create (in order)
+    let directories = vec![
+        "/root_dir",
+        "/root_dir/subdir1", 
+        "/root_dir/subdir1/deep",
+        "/root_dir/subdir1/deep/deeper",
+        "/root_dir/subdir2",
+        "/root_dir/subdir2/logs",
+        "/root_dir/temp",
+    ];
 
-    tracing::debug!("Listing files inside the directory");
-    let resp = manager.list_directory_entries(Path::new("/directory")).await;
-    tracing::info!("Response: {:?}", resp);
+    // Create all directories
+    tracing::info!("=== Creating directory structure ===");
+    for dir_path in &directories {
+        tracing::debug!("Creating directory: {}", dir_path);
+        let resp = manager.create(Path::new(dir_path), true).await;
+        match resp {
+            Ok(_) => tracing::info!("Successfully created directory: {}", dir_path),
+            Err(e) => {
+                tracing::error!("Failed to create directory {}: {:?}", dir_path, e);
+                return;
+            }
+        }
+    }
 
-    tracing::debug!("Reading size of file");
-    let resp = manager.get_size(Path::new("/directory/testfile")).await;
-    let size = match resp {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("Could not get size: {:?}", e);
+    // Create and write to all files
+    tracing::info!("=== Creating and writing to files ===");
+    for (file_path, content) in &test_files {
+        tracing::debug!("Creating file: {}", file_path);
+        let resp = manager.create(Path::new(file_path), false).await;
+        match resp {
+            Ok(_) => tracing::info!("Successfully created file: {}", file_path),
+            Err(e) => {
+                tracing::error!("Failed to create file {}: {:?}", file_path, e);
+                return;
+            }
+        }
+
+        tracing::debug!("Writing to file: {}", file_path);
+        let resp = manager.write(Path::new(file_path), 0, content.as_bytes().to_vec()).await;
+        match resp {
+            Ok(_) => tracing::info!("Successfully wrote {} bytes to {}", content.len(), file_path),
+            Err(e) => {
+                tracing::error!("Failed to write to file {}: {:?}", file_path, e);
+                return;
+            }
+        }
+    }
+
+    // List contents of each directory
+    tracing::info!("=== Listing directory contents ===");
+    for dir_path in &directories {
+        tracing::debug!("Listing contents of: {}", dir_path);
+        let resp = manager.list_directory_entries(Path::new(dir_path)).await;
+        match resp {
+            Ok(entries) => {
+                tracing::info!("Directory {} contains {} entries: {:?}", dir_path, entries.len(), entries);
+            },
+            Err(e) => {
+                tracing::error!("Failed to list directory {}: {:?}", dir_path, e);
+                return;
+            }
+        }
+    }
+
+    // Read back all files and verify content
+    tracing::info!("=== Reading and verifying file contents ===");
+    let mut total_bytes_read = 0;
+    let mut total_bytes_expected = 0;
+    
+    for (file_path, expected_content) in &test_files {
+        tracing::debug!("Getting size of file: {}", file_path);
+        let size = match manager.get_size(Path::new(file_path)).await {
+            Ok(s) => {
+                tracing::info!("File {} has size: {}", file_path, s);
+                s
+            },
+            Err(e) => {
+                tracing::error!("Could not get size of file {}: {:?}", file_path, e);
+                return;
+            }
+        };
+
+        tracing::debug!("Reading file: {}", file_path);
+        let resp = manager.read(Path::new(file_path), 0, size).await;
+        let actual_content = match resp {
+            Ok(data) => {
+                match String::from_utf8(data) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to decode UTF-8 content from {}: {:?}", file_path, e);
+                        return;
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::error!("Failed to read file {}: {:?}", file_path, e);
+                return;
+            }
+        };
+
+        // Verify content matches
+        if actual_content == *expected_content {
+            tracing::info!("✓ File {} content verified ({} bytes)", file_path, size);
+            total_bytes_read += size;
+            total_bytes_expected += expected_content.len();
+        } else {
+            tracing::error!("✗ File {} content mismatch! Expected: '{}', Got: '{}'", 
+                           file_path, expected_content, actual_content);
             return;
         }
-    };
-    tracing::info!("Response: {:?}, size: {}", resp, size);
+    }
 
-    tracing::debug!("Reading the file with the size obtained");
-    let resp = manager.read(Path::new("/directory/testfile"), 0, size).await;
-    let str = String::from_utf8(match resp {
-        Ok(ref v) => v.to_vec(),
-        _ => {
-            tracing::error!("wrong thing read");
-            return;
+    tracing::info!("=== Verification Summary ===");
+    tracing::info!("Total files processed: {}", test_files.len());
+    tracing::info!("Total bytes read: {}", total_bytes_read);
+    tracing::info!("Total bytes expected: {}", total_bytes_expected);
+    
+    if total_bytes_read == total_bytes_expected as u64 {
+        tracing::info!("✓ All file content verification passed!");
+    } else {
+        tracing::error!("✗ Byte count mismatch: read {} but expected {}", total_bytes_read, total_bytes_expected);
+        return;
+    }
+
+    // Clean up: Delete all files first
+    tracing::info!("=== Cleaning up files ===");
+    for (file_path, _) in &test_files {
+        tracing::debug!("Deleting file: {}", file_path);
+        let resp = manager.delete(Path::new(file_path), false).await;
+        match resp {
+            Ok(_) => tracing::info!("Successfully deleted file: {}", file_path),
+            Err(e) => {
+                tracing::error!("Failed to delete file {}: {:?}", file_path, e);
+                return;
+            }
         }
-    }).unwrap();
-    tracing::info!("Response: {:?}, decoded: {}", resp, str);
+    }
 
-    tracing::debug!("Deleting the file");
-    let resp = manager.delete(Path::new("/directory/testfile"), false).await;
-    tracing::info!("Response: {:?}", resp);
+    // Clean up: Delete directories in reverse order (deepest first)
+    tracing::info!("=== Cleaning up directories ===");
+    let mut dirs_reversed = directories.clone();
+    dirs_reversed.reverse();
+    
+    for dir_path in &dirs_reversed {
+        tracing::debug!("Deleting directory: {}", dir_path);
+        let resp = manager.delete(Path::new(dir_path), true).await;
+        match resp {
+            Ok(_) => tracing::info!("Successfully deleted directory: {}", dir_path),
+            Err(e) => {
+                tracing::error!("Failed to delete directory {}: {:?}", dir_path, e);
+                return;
+            }
+        }
+    }
 
-    tracing::debug!("Deleting the directory");
-    let resp = manager.delete(Path::new("/directory"), true).await;
-    tracing::info!("Response: {:?}", resp);
+    tracing::info!("🎉 All filesystem operations completed successfully!");
 
 }
