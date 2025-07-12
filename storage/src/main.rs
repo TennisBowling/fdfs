@@ -9,15 +9,15 @@ async fn create_empty_entries(mut file: File) {
     file.write_all(&bitcode::encode(&entries)).await.unwrap();
 }
 
-async fn handle_create(device: &str, inode: Inode, parent_inode: Inode, name: String, is_dir: bool) -> OpResponse {
+async fn handle_createentry(device: &str, inode: Inode, entry: Entry) -> OpResponse {
     let mut file = match tokio::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(format!("{}dino{}", device, parent_inode.0))
+        .open(format!("{}dino{}", device, inode.0))
         .await {
             Ok(f) => f,
             Err(e) => {
-                tracing::error!("Error opening file to write to parent node {:?} inode {:?}: {}", parent_inode, inode, e);
+                tracing::error!("Error opening file to write to parent node {:?} inode {:?}: {}", inode, entry.inode, e);
                 return OpResponse::Error(format!("{}", e));
             }
         };
@@ -35,19 +35,73 @@ async fn handle_create(device: &str, inode: Inode, parent_inode: Inode, name: St
     }
 
     // Add the new file to the list of files that the directory contains
-    entries.push(Entry { name, inode, is_dir });
+    entries.push(entry);
 
     file.set_len(0).await.unwrap();
     file.seek(SeekFrom::Start(0)).await.unwrap();
     file.write_all(&bitcode::encode(&entries)).await.unwrap();
 
+    OpResponse::CreateEntryOk
+}
+
+async fn handle_deleteentry(device: &str, parent_inode: Inode, inode: Inode) -> OpResponse {
+    let mut file = match tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("{}dino{}", device, parent_inode.0))
+        .await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("Error opening file to write to parent node {:?} the deletion of inode {:?}: {}", parent_inode, inode, e);
+                return OpResponse::Error(format!("{}", e));
+            }
+        };
+
+
+    let file_len = file.metadata().await.unwrap().len() as usize;
+    let mut buf = vec![0u8; file_len];
+    file.read_exact(&mut buf).await.unwrap();
+    let mut entries: Vec<Entry> = bitcode::decode(&buf).unwrap();
+    
+    let mut idx: Option<usize> = None;
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.inode.0 == inode.0 {
+            idx = Some(index);
+        }
+    }
+
+    if idx == None {
+        return OpResponse::Error("Unable to find entry in directory".to_string());
+    }
+    
+    entries.remove(idx.unwrap());    // Remove from the entries and then rewrite all the entries to the file
+
+    file.set_len(0).await.unwrap();
+    file.seek(SeekFrom::Start(0)).await.unwrap();
+    file.write_all(&bitcode::encode(&entries)).await.unwrap();
+
+    OpResponse::DeleteEntryOk
+}
+
+async fn handle_create(device: &str, inode: Inode, is_dir: bool) -> OpResponse {
+    // Just to be careful, create_new will return an error if one already exists and create will truncate
     if is_dir {
-        // Just to be careful, create_new will return an error if one already exists and create will truncate
-        let file = File::create_new(format!("{}dino{}", device, inode.0)).await.unwrap();
+        let file = match File::create_new(format!("{}dino{}", device, inode.0)).await {
+            Ok(f) => f,
+            Err(e) => {
+                return OpResponse::Error(format!("{:?}", e));
+            }
+        };
+
         create_empty_entries(file).await;
     }
     else {
-        File::create_new(format!("{}ino{}", device, inode.0)).await.unwrap();
+        match File::create_new(format!("{}ino{}", device, inode.0)).await {
+            Ok(_) => {},
+            Err(e) => {
+                return OpResponse::Error(format!("{:?}", e));
+            }
+        };
     }
 
     OpResponse::CreateOk
@@ -108,49 +162,13 @@ async fn handle_read(device: &str, inode: Inode, offset: u64, size: u64) -> OpRe
     OpResponse::ReadData(buf)
 }
 
-async fn handle_delete(device: &str, inode: Inode, parent_inode: Inode, is_dir: bool) -> OpResponse {
+async fn handle_delete(device: &str, inode: Inode, is_dir: bool) -> OpResponse {
     if is_dir {
         tokio::fs::remove_file(format!("{}dino{}", device, inode.0)).await.unwrap();
     }
     else {
         tokio::fs::remove_file(format!("{}ino{}", device, inode.0)).await.unwrap();
     }
-
-
-    let mut file = match tokio::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("{}dino{}", device, parent_inode.0))
-        .await {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("Error opening file to write to parent node {:?} the deletion of inode {:?}: {}", parent_inode, inode, e);
-                return OpResponse::Error(format!("{}", e));
-            }
-        };
-
-
-    let file_len = file.metadata().await.unwrap().len() as usize;
-    let mut buf = vec![0u8; file_len];
-    file.read_exact(&mut buf).await.unwrap();
-    let mut entries: Vec<Entry> = bitcode::decode(&buf).unwrap();
-    
-    let mut idx: Option<usize> = None;
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.inode.0 == inode.0 {
-            idx = Some(index);
-        }
-    }
-
-    if idx == None {
-        return OpResponse::Error("Unable to find entry in directory".to_string());
-    }
-    
-    entries.remove(idx.unwrap());    // Remove from the entries and then rewrite all the entries to the file
-
-    file.set_len(0).await.unwrap();
-    file.seek(SeekFrom::Start(0)).await.unwrap();
-    file.write_all(&bitcode::encode(&entries)).await.unwrap();
 
     OpResponse::DeleteOk
 }
@@ -213,6 +231,8 @@ async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<
 
         tracing::debug!("Decoded op from client");
 
+
+        // Should probably trim this down with a macro
         match op {
             Op::Write { inode, offset, data } => {
                 tracing::debug!("Write op from client");
@@ -228,16 +248,30 @@ async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<
                 send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote read response to client");
             },
-            Op::Create { inode, parent_inode, name, is_dir } => {
+            Op::CreateEntry { inode, entry } => {
+                tracing::debug!("CreateEntry op from client");
+                let payload = handle_createentry(&device, inode, entry).await;
+
+                send_response(&mut stream, payload).await?;
+                tracing::debug!("Wrote CreateEntry response to client");
+            },
+            Op::DeleteEntry { inode, parent_inode } => {
+                tracing::debug!("DeleteEntry op from client");
+                let payload = handle_deleteentry(&device, parent_inode, inode).await;
+
+                send_response(&mut stream, payload).await?;
+                tracing::debug!("Wrote DeleteEntry response to client");
+            },
+            Op::Create { inode, is_dir } => {
                 tracing::debug!("Create op from client");
-                let payload = handle_create(&device, inode, parent_inode, name, is_dir).await;
+                let payload = handle_create(&device, inode, is_dir).await;
 
                 send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote create response to client");
             },
-            Op::Delete { inode, parent_inode, is_dir } => {
+            Op::Delete { inode, is_dir } => {
                 tracing::debug!("Delete op from client");
-                let payload = handle_delete(&device, inode, parent_inode, is_dir).await;
+                let payload = handle_delete(&device, inode, is_dir).await;
 
                 send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote delete response to client");
@@ -284,24 +318,9 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     tracing::info!("Starting fdfs storage server");
 
-    let listener = TcpListener::bind("0.0.0.0:10001").await.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:10000").await.unwrap();
 
     let device = "./".to_string();
-
-    // Initialize special directory inode 1
-    match File::create_new(format!("{}dino1", device)).await {
-        Ok(file) => {
-            tracing::info!("Creating special directory inode 1");
-            create_empty_entries(file).await;
-        }
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                tracing::debug!("No need to create special directory inode 1");
-            } else {
-                tracing::info!("Error creating special directory inode 1: {}", e);
-            }
-        }
-    }
 
     loop {
         let (stream, _) = listener.accept().await.unwrap();
