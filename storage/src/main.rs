@@ -306,7 +306,55 @@ async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<
 
 #[tokio::main]
 async fn main() {
-    let log_level = "debug";
+
+    let matches = clap::App::new("fdfs-server")
+        .version("0.0.1")
+        .author("TennisBowling <tennisbowling@tennisbowling.com>")
+        .setting(clap::AppSettings::ColoredHelp)
+        .about("The storage server for fdfs, the Fast Distributed File System written in Rust")
+        .long_version("fdfs version {} by TennisBowling <tennisbowling@tennisbowling.com>")
+        .arg(
+            clap::Arg::with_name("port")
+                .short("p")
+                .long("port")
+                .value_name("PORT")
+                .help("Port to listen on")
+                .takes_value(true)
+                .default_value("10000"),
+        )
+        .arg(
+            clap::Arg::with_name("listen-addr")
+                .short("addr")
+                .long("listen-addr")
+                .help("Address to listen for requests on")
+                .takes_value(true)
+                .default_value("0.0.0.0"),
+        )
+        .arg(
+            clap::Arg::with_name("storage-dir")
+                .short("storage")
+                .long("storage-dir")
+                .help("Directory to store files in to ")
+                .takes_value(true)
+                .default_value("./"),
+        )
+        .arg(
+            clap::Arg::with_name("log-level")
+                .short("l")
+                .long("log-level")
+                .value_name("LOG")
+                .help("Log level: debug, info, warn, crit")
+                .takes_value(true)
+                .default_value("debug"),
+        )
+        .get_matches();
+    
+    let listen_addr = matches.value_of("listen-addr").unwrap();
+    let port = matches.value_of("port").unwrap();
+    let storage_dir = matches.value_of("storage-dir").unwrap();
+    let log_level = matches.value_of("log-level").unwrap();
+
+
     let filter_string = format!("{},hyper=info", log_level);
 
     let filter = EnvFilter::try_new(filter_string).unwrap_or_else(|_| EnvFilter::new(log_level));
@@ -317,10 +365,11 @@ async fn main() {
 
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     tracing::info!("Starting fdfs storage server");
+    
 
-    let listener = TcpListener::bind("0.0.0.0:10000").await.unwrap();
+    let listener = TcpListener::bind(format!("{}:{}", listen_addr, port)).await.unwrap();
 
-    let device = "./".to_string();
+    let device = storage_dir.to_string();
 
     loop {
         let (stream, _) = listener.accept().await.unwrap();
