@@ -1,6 +1,6 @@
 use gxhash::gxhash64;
 use shared::*;
-use std::{error::Error, sync::atomic::AtomicUsize, time::Instant};
+use std::{error::Error, os::unix::ffi::OsStrExt, path::{self, Path}, sync::atomic::AtomicUsize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -8,8 +8,10 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
-pub fn path_to_inode(str: &str) -> Inode {
-    Inode(gxhash64(str.as_bytes(), 17))
+
+#[inline]
+pub fn path_to_inode(path: &Path) -> Inode {
+    Inode(gxhash64(path.as_os_str().as_bytes(), 17))
 }
 
 struct NodeConnectionManager {
@@ -77,9 +79,116 @@ impl NodeManager {
         Ok(NodeManager { nodes })
     }
 
+    #[inline]
     pub fn inode_to_server(&self, inode: Inode) -> &NodeConnectionManager {
         let server_index = inode.0 as usize % self.nodes.len();
         self.nodes.get(server_index).unwrap()
+    }
+
+    // Creates the special root directory
+    pub async fn create_special(&self) -> Result<(), Box<dyn Error>> {
+        let file_inode = path_to_inode(Path::new("/"));
+        let file_node = self.inode_to_server(file_inode);
+
+        file_node.send_request(Op::Create { inode: file_inode, is_dir: true }).await?;
+        Ok(())
+    }
+
+    pub async fn create(&self, path: &Path, is_dir: bool) -> Result<(), Box<dyn Error>> {
+        let file_inode = path_to_inode(path);
+        let file_node = self.inode_to_server(file_inode);
+
+        let parent_inode = path_to_inode(path.parent().unwrap());
+        let parent_node = self.inode_to_server(parent_inode);
+
+        let (file_res, parent_res) = tokio::join!(
+            file_node.send_request(Op::Create { inode: file_inode, is_dir }),
+            parent_node.send_request(
+                Op::CreateEntry { inode: parent_inode, entry: Entry { name: path.file_name().unwrap().to_string_lossy().into_owned(), inode: file_inode, is_dir } }
+            )
+        );
+
+        file_res?;
+        parent_res?;
+        Ok(())
+    }
+
+    // TODO: Recursively delete everything inside if directory = trues
+    pub async fn delete(&self, path: &Path, is_dir: bool) -> Result<(), Box<dyn Error>> {
+        let file_inode = path_to_inode(path);
+        let file_node = self.inode_to_server(file_inode);
+
+        let parent_inode = path_to_inode(path.parent().unwrap());
+        let parent_node = self.inode_to_server(parent_inode);
+
+        let (file_res, parent_res) = tokio::join!(
+            file_node.send_request(Op::Delete { inode: file_inode, is_dir }),
+            parent_node.send_request(Op::DeleteEntry { parent_inode, inode: file_inode })
+        );
+
+        file_res?;
+        parent_res?;
+        Ok(())
+    }
+
+    pub async fn write(&self, path: &Path, offset: u64, data: Vec<u8>) -> Result<(), Box<dyn Error>> {
+        let inode = path_to_inode(path);
+        let node = self.inode_to_server(inode);
+
+        let res = node.send_request(Op::Write { inode, offset, data }).await?;
+
+        match res {
+            OpResponse::WriteOk => Ok(()),
+            OpResponse::Error(e) => {
+                Err(e.into())
+            }
+            _ => unreachable!()
+        }
+    }
+
+    pub async fn read(&self, path: &Path, offset: u64, size: u64) -> Result<Vec<u8>, Box<dyn Error>> {
+        let inode = path_to_inode(path);
+        let node = self.inode_to_server(inode);
+
+        let res = node.send_request(Op::Read { inode, offset, size }).await?;
+
+        match res {
+            OpResponse::ReadData(data) => Ok(data),
+            OpResponse::Error(e) => {
+                Err(e.into())
+            }
+            _ => unreachable!()
+        }
+    }
+
+    pub async fn get_size(&self, path: &Path) -> Result<u64, Box<dyn Error>> {
+        let inode = path_to_inode(path);
+        let node = self.inode_to_server(inode);
+
+        let res = node.send_request(Op::GetSize { inode }).await?;
+
+        match res {
+            OpResponse::SizeData(size) => Ok(size),
+            OpResponse::Error(e) => {
+                Err(e.into())
+            }
+            _ => unreachable!()
+        }
+    }
+
+    pub async fn list_directory_entries(&self, path: &Path) -> Result<Vec<Entry>, Box<dyn Error>> {
+        let inode = path_to_inode(path);
+        let node = self.inode_to_server(inode);
+
+        let res = node.send_request(Op::ListDirEntries { inode }).await?;
+
+        match res {
+            OpResponse::ListDirData(entries) => Ok(entries),
+            OpResponse::Error(e) => {
+                Err(e.into())
+            }
+            _ => unreachable!()
+        }
     }
 }
 
@@ -97,18 +206,12 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Setting default subscriber failed");
     tracing::info!("Starting fdfs client");
 
-    let manager = NodeManager::new(vec!["127.0.0.1:10000".to_string(), "127.0.0.1:10001".to_string()])
+    let manager = NodeManager::new(vec!["127.0.0.1:10000".to_string()])
         .await
         .unwrap();
 
-    let inode = path_to_inode("/test/test.txt");
-    let server = manager.inode_to_server(inode);
-    let resp = server
-        .send_request(Op::Other("hey client!!!!!!!!!".to_string()))
-        .await
-        .unwrap();
-    tracing::info!("response from storage server: {:?}", resp);
-
+    // Create special root directory
+    manager.create_special().await.unwrap();
     
     /*
     We're going to
@@ -122,36 +225,36 @@ async fn main() {
     - Delete the directory
     This covers all of the enumerations of Op */
     tracing::debug!("Creating directory");
-    let resp = server.send_request(Op::Create { inode: Inode(2), parent_inode: Inode(1), name: "directory".to_string(), is_dir: true }).await.unwrap();
+    let resp = manager.create(Path::new("/directory"), true).await;
     tracing::info!("Response: {:?}", resp);
 
     tracing::debug!("Creating test file inside directory");
-    let resp = server.send_request(Op::Create { inode: Inode(3), parent_inode: Inode(2), name: "testfile".to_string(), is_dir: false }).await.unwrap();
+    let resp = manager.create(Path::new("/directory/testfile"), false).await;
     tracing::info!("Response: {:?}", resp);
 
     tracing::debug!("Writing to test file");
-    let resp = server.send_request(Op::Write { inode: Inode(3), offset: 0, data: "hi ab!".as_bytes().to_vec() }).await.unwrap();
+    let resp = manager.write(Path::new("/directory/testfile"), 0, "hi ab!".as_bytes().to_vec()).await;
     tracing::info!("Response: {:?}", resp);
 
     tracing::debug!("Listing files inside the directory");
-    let resp = server.send_request(Op::ListDirEntries { inode: Inode(2) }).await.unwrap();
+    let resp = manager.list_directory_entries(Path::new("/directory")).await;
     tracing::info!("Response: {:?}", resp);
 
     tracing::debug!("Reading size of file");
-    let resp = server.send_request(Op::GetSize { inode: Inode(3) }).await.unwrap();
+    let resp = manager.get_size(Path::new("/directory/testfile")).await;
     let size = match resp {
-        OpResponse::SizeData(s) => s,
-        _ => {
-            tracing::error!("wrong thing read");
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Could not get size: {:?}", e);
             return;
         }
     };
     tracing::info!("Response: {:?}, size: {}", resp, size);
 
     tracing::debug!("Reading the file with the size obtained");
-    let resp = server.send_request(Op::Read { inode: Inode(3), offset: 0, size: size }).await.unwrap();
+    let resp = manager.read(Path::new("/directory/testfile"), 0, size).await;
     let str = String::from_utf8(match resp {
-        OpResponse::ReadData(ref v) => v.to_vec(),
+        Ok(ref v) => v.to_vec(),
         _ => {
             tracing::error!("wrong thing read");
             return;
@@ -160,11 +263,11 @@ async fn main() {
     tracing::info!("Response: {:?}, decoded: {}", resp, str);
 
     tracing::debug!("Deleting the file");
-    let resp = server.send_request(Op::Delete { inode: Inode(3), parent_inode: Inode(2), is_dir: false }).await.unwrap();
+    let resp = manager.delete(Path::new("/directory/testfile"), false).await;
     tracing::info!("Response: {:?}", resp);
 
     tracing::debug!("Deleting the directory");
-    let resp = server.send_request(Op::Delete { inode: Inode(2), parent_inode: Inode(1), is_dir: true }).await.unwrap();
+    let resp = manager.delete(Path::new("/directory"), true).await;
     tracing::info!("Response: {:?}", resp);
 
 }
