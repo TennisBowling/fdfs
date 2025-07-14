@@ -7,7 +7,7 @@ use tokio::{
     sync::Mutex,
 };
 use tracing_subscriber::EnvFilter;
-use fuse3::{path::{self as fuse, reply::{FileAttr, ReplyAttr, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit}, PathFilesystem, Session}, raw::{reply::{ReplyOpen, ReplyXAttr}, Request}, Errno, FileType};
+use fuse3::{path::{self as fuse, reply::{FileAttr, ReplyAttr, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit}, PathFilesystem, Session}, raw::{reply::{ReplyOpen, ReplyStatFs, ReplyXAttr}, Request}, Errno, FileType};
 use fuse3::MountOptions;
 use futures_util::stream::{self, Empty, Iter};
 use fuse3::path::reply::DirectoryEntry;
@@ -119,6 +119,7 @@ impl PathFilesystem for NodeManager {
         // Special root directory
         if path == Path::new("/") {
             let now = SystemTime::now();
+            tracing::info!("Getattr: returning special root directory");
             return Ok(ReplyAttr { ttl: TTL, attr: FileAttr { size: 1, blocks: (1 + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now,
                 kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 } })
         }
@@ -133,12 +134,27 @@ impl PathFilesystem for NodeManager {
         Ok(ReplyAttr { ttl: TTL, attr  })
     }
 
+    // All Fake Data
+    async fn statfs(&self, _req: Request, _path: &OsStr) -> fuse3::Result<ReplyStatFs> {
+        Ok(fuse3::path::reply::ReplyStatFs {
+            blocks: 1000000,      // Total blocks
+            bfree: 1000000,       // Free blocks  
+            bavail: 1000000,      // Available blocks
+            files: 1000000,       // Total inodes
+            ffree: 1000000,       // Free inodes
+            bsize: 4096,          // Block size
+            namelen: 255,         // Max filename length
+            frsize: 4096,         // Fragment size
+        })
+    }
+
     async fn opendir(&self, _req: Request, _path: &OsStr, flags: u32) -> fuse3::Result<ReplyOpen> {
         // We don't use file handles throughout, just use the path throughout
         Ok(ReplyOpen { fh: 0, flags: flags })
     }
 
-    async fn access(&self, _req: Request, _path: &OsStr, _mask: u32) -> fuse3::Result<()> {
+    async fn access(&self, _req: Request, path: &OsStr, _mask: u32) -> fuse3::Result<()> {
+        tracing::info!("Access called on path {:?}", path);
         Ok(())
     }
 
@@ -406,7 +422,7 @@ async fn main() {
     let nodes = matches.value_of("nodes").unwrap();
     let nodes = nodes.split(',').collect::<Vec<&str>>().iter().map(|x| x.to_string()).collect();
 
-    let filter_string = format!("{},hyper=info", log_level);
+    let filter_string = format!("{},hyper=info,fuse3=info", log_level);
 
     let filter = EnvFilter::try_new(filter_string).unwrap_or_else(|_| EnvFilter::new(log_level));
 
