@@ -7,7 +7,7 @@ use tokio::{
     sync::Mutex,
 };
 use tracing_subscriber::EnvFilter;
-use fuse3::{path::{self as fuse, reply::{FileAttr, ReplyAttr, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit}, PathFilesystem, Session}, raw::{reply::ReplyXAttr, Request}, Errno, FileType};
+use fuse3::{path::{self as fuse, reply::{FileAttr, ReplyAttr, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit}, PathFilesystem, Session}, raw::{reply::{ReplyOpen, ReplyXAttr}, Request}, Errno, FileType};
 use fuse3::MountOptions;
 use futures_util::stream::{self, Empty, Iter};
 use fuse3::path::reply::DirectoryEntry;
@@ -73,6 +73,14 @@ impl NodeConnectionManager {
     }
 }
 
+fn normalise_root(path: &OsStr) -> &OsStr {
+    if path.is_empty() || path == OsStr::new("/") {
+        OsStr::new("/")      // always use canonical form
+    } else {
+        path
+    }
+}
+
 struct NodeManager {
     pub nodes: Vec<NodeConnectionManager>,
 }
@@ -92,7 +100,7 @@ impl PathFilesystem for NodeManager {
     async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> fuse3::Result<ReplyEntry> {
         tracing::info!("parent: {:?}, name: {:?}", parent, name);
 
-        let mut path = PathBuf::from(parent);
+        let mut path = PathBuf::from(normalise_root(parent));
         path.push(name);
 
         let attr = self.get_attributes(&PathBuf::from(parent), name, &path).await?;
@@ -103,8 +111,10 @@ impl PathFilesystem for NodeManager {
 
     // TODO: look into using the file handle in order to avoid re-doing everything with the path
     async fn getattr(&self, _req: Request, path: Option<&OsStr>, _fh: Option<u64>, _flags: u32) -> fuse3::Result<ReplyAttr> {
-        let path = PathBuf::from(path.ok_or_else(fuse3::Errno::new_not_exist)?);
+        let raw = path.ok_or_else(fuse3::Errno::new_not_exist)?;
+        let path = PathBuf::from(normalise_root(raw));
         tracing::info!("path is {:?}", path);
+
 
         // Special root directory
         if path == Path::new("/") {
@@ -112,6 +122,7 @@ impl PathFilesystem for NodeManager {
             return Ok(ReplyAttr { ttl: TTL, attr: FileAttr { size: 1, blocks: (1 + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now,
                 kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 } })
         }
+
 
         let parent = path.parent().unwrap();
         let name = path.file_name().unwrap();
@@ -122,20 +133,41 @@ impl PathFilesystem for NodeManager {
         Ok(ReplyAttr { ttl: TTL, attr  })
     }
 
+    async fn opendir(&self, _req: Request, _path: &OsStr, flags: u32) -> fuse3::Result<ReplyOpen> {
+        // We don't use file handles throughout, just use the path throughout
+        Ok(ReplyOpen { fh: 0, flags: flags })
+    }
+
+    async fn access(&self, _req: Request, _path: &OsStr, _mask: u32) -> fuse3::Result<()> {
+        Ok(())
+    }
+
     type DirEntryStream<'a>
         = Iter<IntoIter<fuse3::Result<DirectoryEntry>>>
     where
         Self: 'a;
 
-    async fn readdir<'a>(&'a self, _req: Request, path: &'a OsStr, _fh: u64, _offset: i64) -> fuse3::Result<ReplyDirectory<Self::DirEntryStream<'a> > > {
+    async fn readdir<'a>(&'a self, _req: Request, path: &'a OsStr, _fh: u64, offset: i64) -> fuse3::Result<ReplyDirectory<Self::DirEntryStream<'a> > > {
         tracing::error!("READDIR called for path: {:?}", path);
-        let path = PathBuf::from(path);
+        let path = PathBuf::from(normalise_root(path));
         let dir_entries = self.list_directory_entries(&path).await.unwrap();
 
-        // TODO: As with readdirplus, try to remove that clone on the name
-        let out: Vec<Result<DirectoryEntry, Errno>> = dir_entries.iter().enumerate().map(|(idx, entry)| Ok::<DirectoryEntry, Errno>(
-            DirectoryEntry { kind: if entry.is_dir {FileType::Directory} else {FileType::RegularFile}, name: entry.name.clone().into(), offset: idx as i64 })).collect();
+        let mut out: Vec<Result<DirectoryEntry, Errno>> = Vec::with_capacity(dir_entries.len());
 
+        out.push(Ok(
+            DirectoryEntry { kind: FileType::Directory, name: ".".into(), offset: 1 }
+        ));
+        out.push(Ok(
+            DirectoryEntry { kind: FileType::Directory, name: "..".into(), offset: 2 }
+        ));
+
+        // TODO: As with readdirplus, try to remove that clone on the name
+        for (idx, entry) in dir_entries.iter().enumerate() {
+            out.push(Ok::<DirectoryEntry, Errno>(
+            DirectoryEntry { kind: if entry.is_dir {FileType::Directory} else {FileType::RegularFile}, name: entry.name.clone().into(), offset: (idx + 3) as i64 }));
+        }
+
+        let out: Vec<Result<DirectoryEntry, Errno>> = out.into_iter().skip(offset as usize).collect();
         Ok(ReplyDirectory { entries: stream::iter(out) })
     }
 
@@ -144,26 +176,44 @@ impl PathFilesystem for NodeManager {
     where
         Self: 'a;
 
+    // TODO: make sure nlink works correctly: just count the number of directories inside +2 
     // Pagination of the directory's entries, but since we HAVE to get all files inside a directory anyways might as well just ignore it and return everything
-    async fn readdirplus<'a> (&'a self, _req: Request, parent: &'a OsStr, _fh: u64, _offset: u64, _lock_owner: u64) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a> > > {
+    async fn readdirplus<'a> (&'a self, _req: Request, parent: &'a OsStr, _fh: u64, offset: u64, _lock_owner: u64) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a> > > {
         tracing::error!("READDIRPLUS called for path: {:?}", parent);
-        let path = PathBuf::from(parent);
+        let path = PathBuf::from(normalise_root(parent));
         let dir_entries = self.list_directory_entries(&path).await.unwrap();
 
         let now = SystemTime::now();
-        let mut out = Vec::with_capacity(dir_entries.len());
+        let mut out: Vec<Result<DirectoryEntryPlus, Errno>> = Vec::with_capacity(dir_entries.len());
+
+        out.push(Ok(
+            DirectoryEntryPlus { kind: FileType::Directory, name: ".".into(), offset: 1,
+                attr: FileAttr { size: 1, blocks: 1, atime: now, mtime: now, ctime: now, crtime: now, kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 0,
+                    rdev: 0, flags: 0, blksize: 4096 },
+                entry_ttl: TTL, attr_ttl: TTL }
+        ));
+        out.push(Ok(
+            DirectoryEntryPlus { kind: FileType::Directory, name: "..".into(), offset: 2,
+                attr: FileAttr { size: 1, blocks: 1, atime: now, mtime: now, ctime: now, crtime: now, kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 0,
+                    rdev: 0, flags: 0, blksize: 4096 },
+                entry_ttl: TTL, attr_ttl: TTL }
+        ));
+
         for (idx, entry) in dir_entries.iter().enumerate() {
-            let size = self.get_size(&path).await.unwrap();
+            let mut file_path = path.clone();
+            file_path.push(entry.name.clone());
+
+            let size = self.get_size(&file_path).await.unwrap();
             let file_type = if entry.is_dir {FileType::Directory} else {FileType::RegularFile};
 
             let attr = FileAttr { size, blocks: (size + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now, kind: file_type, perm: 0o777,
                 nlink: if file_type == FileType::Directory {2} else {1}, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 };
 
             // TODO: Try to get rid of this clone on the file name
-            out.push(Ok(DirectoryEntryPlus { kind: file_type, name: entry.name.clone().into(), offset: idx as i64, attr, entry_ttl: TTL, attr_ttl: TTL }));
+            out.push(Ok(DirectoryEntryPlus { kind: file_type, name: entry.name.clone().into(), offset: (idx + 3) as i64, attr, entry_ttl: TTL, attr_ttl: TTL }));
         }
 
-        
+        let out: Vec<Result<DirectoryEntryPlus, Errno>> = out.into_iter().skip(offset as usize).collect();
         Ok(ReplyDirectoryPlus { entries: stream::iter(out) })
     }
     
@@ -202,7 +252,7 @@ impl NodeManager {
                 }
             }
         }
-
+ 
 
         // Blocksize is also fake, apparantly unix blocks are always 512
         let now = SystemTime::now();
