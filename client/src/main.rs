@@ -120,8 +120,8 @@ impl PathFilesystem for NodeManager {
         if path == Path::new("/") {
             let now = SystemTime::now();
             tracing::info!("Getattr: returning special root directory");
-            return Ok(ReplyAttr { ttl: TTL, attr: FileAttr { size: 1, blocks: (1 + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now,
-                kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 } })
+            return Ok(ReplyAttr { ttl: TTL, attr: FileAttr { size: 1, blocks: (1 + 511) / 512, atime: now, mtime: now, ctime: now,
+                kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 9, rdev: 0, blksize: 4096 } })
         }
 
 
@@ -204,14 +204,14 @@ impl PathFilesystem for NodeManager {
 
         out.push(Ok(
             DirectoryEntryPlus { kind: FileType::Directory, name: ".".into(), offset: 1,
-                attr: FileAttr { size: 1, blocks: 1, atime: now, mtime: now, ctime: now, crtime: now, kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 0,
-                    rdev: 0, flags: 0, blksize: 4096 },
+                attr: FileAttr { size: 1, blocks: 1, atime: now, mtime: now, ctime: now, kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 0,
+                    rdev: 0, blksize: 4096 },
                 entry_ttl: TTL, attr_ttl: TTL }
         ));
         out.push(Ok(
             DirectoryEntryPlus { kind: FileType::Directory, name: "..".into(), offset: 2,
-                attr: FileAttr { size: 1, blocks: 1, atime: now, mtime: now, ctime: now, crtime: now, kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 0,
-                    rdev: 0, flags: 0, blksize: 4096 },
+                attr: FileAttr { size: 1, blocks: 1, atime: now, mtime: now, ctime: now, kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 0,
+                    rdev: 0, blksize: 4096 },
                 entry_ttl: TTL, attr_ttl: TTL }
         ));
 
@@ -222,8 +222,8 @@ impl PathFilesystem for NodeManager {
             let size = self.get_size(&file_path).await.unwrap();
             let file_type = if entry.is_dir {FileType::Directory} else {FileType::RegularFile};
 
-            let attr = FileAttr { size, blocks: (size + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now, kind: file_type, perm: 0o777,
-                nlink: if file_type == FileType::Directory {2} else {1}, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 };
+            let attr = FileAttr { size, blocks: (size + 511) / 512, atime: now, mtime: now, ctime: now, kind: file_type, perm: 0o777,
+                nlink: if file_type == FileType::Directory {2} else {1}, uid: 0, gid: 9, rdev: 0, blksize: 4096 };
 
             // TODO: Try to get rid of this clone on the file name
             out.push(Ok(DirectoryEntryPlus { kind: file_type, name: entry.name.clone().into(), offset: (idx + 3) as i64, attr, entry_ttl: TTL, attr_ttl: TTL }));
@@ -273,7 +273,7 @@ impl NodeManager {
         // Blocksize is also fake, apparantly unix blocks are always 512
         let now = SystemTime::now();
         Ok(
-            FileAttr { size, blocks: (size + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now, kind: file_type, perm: 0o777, nlink: if file_type == FileType::Directory {2} else {1}, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 } 
+            FileAttr { size, blocks: (size + 511) / 512, atime: now, mtime: now, ctime: now, kind: file_type, perm: 0o777, nlink: if file_type == FileType::Directory {2} else {1}, uid: 0, gid: 9, rdev: 0, blksize: 4096 } 
         )
     }
 
