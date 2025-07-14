@@ -440,6 +440,8 @@ async fn main() {
     // Create special root directory
     manager.create_special().await.unwrap();
 
+    manager.create(Path::new("/testfile"), false).await.unwrap();
+
     // Take a look at write back cache
     let options = MountOptions::default().fs_name("fdfs").force_readdir_plus(true).custom_options("noatime").custom_options("nosuid").custom_options("nodev").custom_options("async").to_owned();
     let handle = Session::new(options).mount(manager, "/tmp/fdfs").await.unwrap();
