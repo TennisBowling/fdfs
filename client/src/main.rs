@@ -1,13 +1,21 @@
 use gxhash::gxhash64;
 use shared::*;
-use std::{error::Error, os::unix::ffi::OsStrExt, path::Path, sync::atomic::AtomicUsize};
+use std::{error::Error, ffi::OsStr, num::NonZeroU32, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::atomic::AtomicUsize, time::{Duration, SystemTime}};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::Mutex,
 };
 use tracing_subscriber::EnvFilter;
+use fuse3::{path::{self as fuse, reply::{FileAttr, ReplyAttr, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit}, PathFilesystem, Session}, raw::{reply::ReplyXAttr, Request}, Errno, FileType};
+use fuse3::MountOptions;
+use futures_util::stream::{self, Empty, Iter};
+use fuse3::path::reply::DirectoryEntry;
+use fuse3::path::reply::DirectoryEntryPlus;
+use std::vec::IntoIter;
 
+
+const TTL: Duration = Duration::new(2, 0);
 
 #[inline]
 pub fn path_to_inode(path: &Path) -> Inode {
@@ -69,6 +77,98 @@ struct NodeManager {
     pub nodes: Vec<NodeConnectionManager>,
 }
 
+impl PathFilesystem for NodeManager {
+
+    async fn init(&self, _req: Request) -> fuse3::Result<ReplyInit> {
+        Ok(ReplyInit {
+            max_write: NonZeroU32::new(16 * 1024).unwrap(),
+        })
+    }
+
+    async fn destroy(&self, _req: Request) {
+        tracing::info!("fdfs shutting down");
+    }
+
+    async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> fuse3::Result<ReplyEntry> {
+        tracing::info!("parent: {:?}, name: {:?}", parent, name);
+
+        let mut path = PathBuf::from(parent);
+        path.push(name);
+
+        let attr = self.get_attributes(&PathBuf::from(parent), name, &path).await?;
+        
+        Ok(ReplyEntry { ttl: TTL, attr  })
+        
+    }
+
+    // TODO: look into using the file handle in order to avoid re-doing everything with the path
+    async fn getattr(&self, _req: Request, path: Option<&OsStr>, _fh: Option<u64>, _flags: u32) -> fuse3::Result<ReplyAttr> {
+        let path = PathBuf::from(path.ok_or_else(fuse3::Errno::new_not_exist)?);
+        tracing::info!("path is {:?}", path);
+
+        // Special root directory
+        if path == Path::new("/") {
+            let now = SystemTime::now();
+            return Ok(ReplyAttr { ttl: TTL, attr: FileAttr { size: 1, blocks: (1 + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now,
+                kind: FileType::Directory, perm: 0o777, nlink: 2, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 } })
+        }
+
+        let parent = path.parent().unwrap();
+        let name = path.file_name().unwrap();
+        
+
+        let attr = self.get_attributes(&PathBuf::from(parent), name, &path).await?;
+        
+        Ok(ReplyAttr { ttl: TTL, attr  })
+    }
+
+    type DirEntryStream<'a>
+        = Iter<IntoIter<fuse3::Result<DirectoryEntry>>>
+    where
+        Self: 'a;
+
+    async fn readdir<'a>(&'a self, _req: Request, path: &'a OsStr, _fh: u64, _offset: i64) -> fuse3::Result<ReplyDirectory<Self::DirEntryStream<'a> > > {
+        tracing::error!("READDIR called for path: {:?}", path);
+        let path = PathBuf::from(path);
+        let dir_entries = self.list_directory_entries(&path).await.unwrap();
+
+        // TODO: As with readdirplus, try to remove that clone on the name
+        let out: Vec<Result<DirectoryEntry, Errno>> = dir_entries.iter().enumerate().map(|(idx, entry)| Ok::<DirectoryEntry, Errno>(
+            DirectoryEntry { kind: if entry.is_dir {FileType::Directory} else {FileType::RegularFile}, name: entry.name.clone().into(), offset: idx as i64 })).collect();
+
+        Ok(ReplyDirectory { entries: stream::iter(out) })
+    }
+
+    type DirEntryPlusStream<'a>
+        = Iter<IntoIter<fuse3::Result<DirectoryEntryPlus>>>
+    where
+        Self: 'a;
+
+    // Pagination of the directory's entries, but since we HAVE to get all files inside a directory anyways might as well just ignore it and return everything
+    async fn readdirplus<'a> (&'a self, _req: Request, parent: &'a OsStr, _fh: u64, _offset: u64, _lock_owner: u64) -> fuse3::Result<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a> > > {
+        tracing::error!("READDIRPLUS called for path: {:?}", parent);
+        let path = PathBuf::from(parent);
+        let dir_entries = self.list_directory_entries(&path).await.unwrap();
+
+        let now = SystemTime::now();
+        let mut out = Vec::with_capacity(dir_entries.len());
+        for (idx, entry) in dir_entries.iter().enumerate() {
+            let size = self.get_size(&path).await.unwrap();
+            let file_type = if entry.is_dir {FileType::Directory} else {FileType::RegularFile};
+
+            let attr = FileAttr { size, blocks: (size + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now, kind: file_type, perm: 0o777,
+                nlink: if file_type == FileType::Directory {2} else {1}, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 };
+
+            // TODO: Try to get rid of this clone on the file name
+            out.push(Ok(DirectoryEntryPlus { kind: file_type, name: entry.name.clone().into(), offset: idx as i64, attr, entry_ttl: TTL, attr_ttl: TTL }));
+        }
+
+        
+        Ok(ReplyDirectoryPlus { entries: stream::iter(out) })
+    }
+    
+}
+
 impl NodeManager {
     async fn new(nodes_strings: Vec<String>) -> Result<NodeManager, Box<dyn Error>> {
         let mut nodes = Vec::with_capacity(nodes_strings.len());
@@ -77,6 +177,38 @@ impl NodeManager {
         }
 
         Ok(NodeManager { nodes })
+    }
+
+    // TODO: optimize the arguments of this function
+    async fn get_attributes(&self, parent: &Path, name: &OsStr, full_path: &Path) -> fuse3::Result<FileAttr> {
+        let mut size = 1;
+        let mut file_type = FileType::Directory;
+
+        // TODO: Real error types to see when a directory actually doesnt exist
+        let dir_entries = match self.list_directory_entries(parent).await {
+            Ok(de) => de,
+            Err(e) => {
+                tracing::error!("Error listing directory for path {:?}: {}", parent, e);
+                return Err(fuse3::Errno::new_not_exist())
+            }
+        };
+
+
+        for entry in dir_entries {
+            if *entry.name == *name {
+                if !entry.is_dir {
+                    size = self.get_size(&full_path).await.unwrap();
+                    file_type = FileType::RegularFile;
+                }
+            }
+        }
+
+
+        // Blocksize is also fake, apparantly unix blocks are always 512
+        let now = SystemTime::now();
+        Ok(
+            FileAttr { size, blocks: (size + 511) / 512, atime: now, mtime: now, ctime: now, crtime: now, kind: file_type, perm: 0o777, nlink: if file_type == FileType::Directory {2} else {1}, uid: 0, gid: 9, rdev: 0, flags: 0, blksize: 4096 } 
+        )
     }
 
     #[inline]
@@ -241,186 +373,12 @@ async fn main() {
 
     // Create special root directory
     manager.create_special().await.unwrap();
-    
-    /*
-    Comprehensive filesystem manager test:
-    - Create nested directory structure
-    - Create multiple files with different content
-    - Write to all files
-    - Read back and verify content
-    - Clean up everything
-    This covers all of the enumerations of Op with extensive testing */
 
-    // Test data for our files
-    let test_files = vec![
-        ("/root_dir/file1.txt", "Hello World!"),
-        ("/root_dir/file2.txt", "This is test file number 2 with more content."),
-        ("/root_dir/subdir1/nested_file1.txt", "Nested file content here."),
-        ("/root_dir/subdir1/nested_file2.txt", "Another nested file with different data."),
-        ("/root_dir/subdir1/deep/deeper/deepest_file.txt", "Very deep nested file content!"),
-        ("/root_dir/subdir2/config.txt", "configuration=test\nvalue=42\nstatus=active"),
-        ("/root_dir/subdir2/data.txt", "1,2,3,4,5\na,b,c,d,e\ntest,data,here"),
-        ("/root_dir/subdir2/logs/app.log", "2025-01-01 12:00:00 INFO: Application started"),
-        ("/root_dir/subdir2/logs/error.log", "2025-01-01 12:01:00 ERROR: Something went wrong"),
-        ("/root_dir/temp/temp_file.tmp", "Temporary file content for testing"),
-    ];
+    // Take a look at write back cache
+    let options = MountOptions::default().fs_name("fdfs").force_readdir_plus(true).custom_options("noatime").custom_options("nosuid").custom_options("nodev").custom_options("async").to_owned();
+    let handle = Session::new(options).mount(manager, "/tmp/fdfs").await.unwrap();
 
-    // Directories to create (in order)
-    let directories = vec![
-        "/root_dir",
-        "/root_dir/subdir1", 
-        "/root_dir/subdir1/deep",
-        "/root_dir/subdir1/deep/deeper",
-        "/root_dir/subdir2",
-        "/root_dir/subdir2/logs",
-        "/root_dir/temp",
-    ];
-
-    // Create all directories
-    tracing::info!("=== Creating directory structure ===");
-    for dir_path in &directories {
-        tracing::debug!("Creating directory: {}", dir_path);
-        let resp = manager.create(Path::new(dir_path), true).await;
-        match resp {
-            Ok(_) => tracing::info!("Successfully created directory: {}", dir_path),
-            Err(e) => {
-                tracing::error!("Failed to create directory {}: {:?}", dir_path, e);
-                return;
-            }
-        }
-    }
-
-    // Create and write to all files
-    tracing::info!("=== Creating and writing to files ===");
-    for (file_path, content) in &test_files {
-        tracing::debug!("Creating file: {}", file_path);
-        let resp = manager.create(Path::new(file_path), false).await;
-        match resp {
-            Ok(_) => tracing::info!("Successfully created file: {}", file_path),
-            Err(e) => {
-                tracing::error!("Failed to create file {}: {:?}", file_path, e);
-                return;
-            }
-        }
-
-        tracing::debug!("Writing to file: {}", file_path);
-        let resp = manager.write(Path::new(file_path), 0, content.as_bytes().to_vec()).await;
-        match resp {
-            Ok(_) => tracing::info!("Successfully wrote {} bytes to {}", content.len(), file_path),
-            Err(e) => {
-                tracing::error!("Failed to write to file {}: {:?}", file_path, e);
-                return;
-            }
-        }
-    }
-
-    // List contents of each directory
-    tracing::info!("=== Listing directory contents ===");
-    for dir_path in &directories {
-        tracing::debug!("Listing contents of: {}", dir_path);
-        let resp = manager.list_directory_entries(Path::new(dir_path)).await;
-        match resp {
-            Ok(entries) => {
-                tracing::info!("Directory {} contains {} entries: {:?}", dir_path, entries.len(), entries);
-            },
-            Err(e) => {
-                tracing::error!("Failed to list directory {}: {:?}", dir_path, e);
-                return;
-            }
-        }
-    }
-
-    // Read back all files and verify content
-    tracing::info!("=== Reading and verifying file contents ===");
-    let mut total_bytes_read = 0;
-    let mut total_bytes_expected = 0;
-    
-    for (file_path, expected_content) in &test_files {
-        tracing::debug!("Getting size of file: {}", file_path);
-        let size = match manager.get_size(Path::new(file_path)).await {
-            Ok(s) => {
-                tracing::info!("File {} has size: {}", file_path, s);
-                s
-            },
-            Err(e) => {
-                tracing::error!("Could not get size of file {}: {:?}", file_path, e);
-                return;
-            }
-        };
-
-        tracing::debug!("Reading file: {}", file_path);
-        let resp = manager.read(Path::new(file_path), 0, size).await;
-        let actual_content = match resp {
-            Ok(data) => {
-                match String::from_utf8(data) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to decode UTF-8 content from {}: {:?}", file_path, e);
-                        return;
-                    }
-                }
-            },
-            Err(e) => {
-                tracing::error!("Failed to read file {}: {:?}", file_path, e);
-                return;
-            }
-        };
-
-        // Verify content matches
-        if actual_content == *expected_content {
-            tracing::info!("✓ File {} content verified ({} bytes)", file_path, size);
-            total_bytes_read += size;
-            total_bytes_expected += expected_content.len();
-        } else {
-            tracing::error!("✗ File {} content mismatch! Expected: '{}', Got: '{}'", 
-                           file_path, expected_content, actual_content);
-            return;
-        }
-    }
-
-    tracing::info!("=== Verification Summary ===");
-    tracing::info!("Total files processed: {}", test_files.len());
-    tracing::info!("Total bytes read: {}", total_bytes_read);
-    tracing::info!("Total bytes expected: {}", total_bytes_expected);
-    
-    if total_bytes_read == total_bytes_expected as u64 {
-        tracing::info!("✓ All file content verification passed!");
-    } else {
-        tracing::error!("✗ Byte count mismatch: read {} but expected {}", total_bytes_read, total_bytes_expected);
-        return;
-    }
-
-    // Clean up: Delete all files first
-    tracing::info!("=== Cleaning up files ===");
-    for (file_path, _) in &test_files {
-        tracing::debug!("Deleting file: {}", file_path);
-        let resp = manager.delete(Path::new(file_path), false).await;
-        match resp {
-            Ok(_) => tracing::info!("Successfully deleted file: {}", file_path),
-            Err(e) => {
-                tracing::error!("Failed to delete file {}: {:?}", file_path, e);
-                return;
-            }
-        }
-    }
-
-    // Clean up: Delete directories in reverse order (deepest first)
-    tracing::info!("=== Cleaning up directories ===");
-    let mut dirs_reversed = directories.clone();
-    dirs_reversed.reverse();
-    
-    for dir_path in &dirs_reversed {
-        tracing::debug!("Deleting directory: {}", dir_path);
-        let resp = manager.delete(Path::new(dir_path), true).await;
-        match resp {
-            Ok(_) => tracing::info!("Successfully deleted directory: {}", dir_path),
-            Err(e) => {
-                tracing::error!("Failed to delete directory {}: {:?}", dir_path, e);
-                return;
-            }
-        }
-    }
-
-    tracing::info!("🎉 All filesystem operations completed successfully!");
+    tokio::signal::ctrl_c().await.unwrap();
+    handle.unmount().await.unwrap();
 
 }
