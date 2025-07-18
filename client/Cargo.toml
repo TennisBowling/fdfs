@@ -11,5 +11,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bitcode = { workspace = true }
 clap = { workspace = true }
+anyhow = { workspace = true }
 fuse3 = { version = "0.8.1", features = ["tokio-runtime", "unprivileged"] }
 futures-util = { version = "0.3.31", features = ["tokio-io"] }
