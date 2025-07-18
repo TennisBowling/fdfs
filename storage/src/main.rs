@@ -152,7 +152,7 @@ async fn handle_read(device: &str, inode: Inode, offset: u64, size: u64) -> OpRe
     };
 
     if offset >= file_size {
-        return OpResponse::ReadData(Vec::new())
+        return OpResponse::ReadData(Vec::new());
     }
 
     let available_to_read = file_size - offset;
