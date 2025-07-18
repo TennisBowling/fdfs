@@ -53,7 +53,15 @@ pub enum Op {
         inode: Inode,
     },
 
+    GetNodeStats,
+
     Other(String),
+}
+
+#[derive(Encode, Decode, Debug)]
+pub struct NodeInfo {
+    pub total_size: u64,
+    pub free: u64,
 }
 
 #[derive(Encode, Decode, Debug)]
@@ -66,5 +74,6 @@ pub enum OpResponse {
     DeleteOk,
     SizeData(u64),
     ListDirData(Vec<Entry>),
+    NodeStats(NodeInfo),
     Error(String),
 }
