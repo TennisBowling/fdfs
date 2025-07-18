@@ -144,6 +144,20 @@ async fn handle_read(device: &str, inode: Inode, offset: u64, size: u64) -> OpRe
             }
         };
 
+    let file_size = match file.metadata().await {
+        Ok(md) => md.len(),
+        Err(e) => {
+            return OpResponse::Error(format!("{}", e));
+        }
+    };
+
+    if offset >= file_size {
+        return OpResponse::ReadData(Vec::new())
+    }
+
+    let available_to_read = file_size - offset;
+    let size = std::cmp::min(size, available_to_read);
+
     match file.seek(SeekFrom::Start(offset)).await {
         Ok(_) => {},
         Err(e) => {
@@ -289,6 +303,14 @@ async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<
 
                 send_response(&mut stream, payload).await?;
                 tracing::debug!("Wrote listdirentries response to client");
+            }
+            Op::GetNodeStats => {
+                tracing::debug!("GetNodeStats op from client");
+
+                let stats = fs2::statvfs(&device)?;
+
+                send_response(&mut stream, OpResponse::NodeStats(NodeInfo { total_size: stats.total_space(), free: stats.free_space() })).await?;
+                tracing::debug!("Wrote getnodestats response to client");
             }
             Op::Other(str) => {
                 tracing::info!("Other message from client: {}", str);
