@@ -9,9 +9,9 @@ use tokio::{
     sync::Mutex,
 };
 use tracing_subscriber::EnvFilter;
-use fuse3::{path::{self as fuse, reply::{FileAttr, ReplyAttr, ReplyCreated, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit}, PathFilesystem, Session}, raw::{reply::{ReplyData, ReplyOpen, ReplyStatFs, ReplyWrite, ReplyXAttr}, Request}, Errno, FileType};
+use fuse3::{path::{reply::{FileAttr, ReplyAttr, ReplyCreated, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit}, PathFilesystem, Session}, raw::{reply::{ReplyData, ReplyOpen, ReplyStatFs, ReplyWrite}, Request}, Errno, FileType};
 use fuse3::MountOptions;
-use futures_util::{future::join_all, stream::{self, Empty, Iter}};
+use futures_util::{future::join_all, stream::{self, Iter}};
 use fuse3::path::reply::DirectoryEntry;
 use fuse3::path::reply::DirectoryEntryPlus;
 use std::vec::IntoIter;
