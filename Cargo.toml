@@ -15,6 +15,7 @@ tracing = "0.1.4"
 tracing-subscriber = {version = "0.3.18", features = ["env-filter"]}
 clap = "2.33.3"
 anyhow = "1.0.98"
+async-rdma = { path = "/home/tennisbowling/async-rdma" }
 
 
 [profile.highperf]
