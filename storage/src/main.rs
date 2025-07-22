@@ -1,7 +1,9 @@
-use std::{error::Error, io::ErrorKind};
+use std::{alloc::Layout, io::ErrorKind, ptr::null, sync::Arc};
+use async_rdma::{LocalMr, LocalMrReadAccess, LocalMrWriteAccess, Rdma, RdmaBuilder, RdmaListener};
 use shared::*;
+use anyhow::Result;
 use tracing_subscriber::EnvFilter;
-use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}, net::{TcpListener, TcpStream}};
+use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom}, sync::Mutex};
 
 
 async fn create_empty_entries(mut file: File) {
@@ -224,104 +226,113 @@ async fn handle_listdirentries(device: &str, inode: Inode) -> OpResponse {
 }
 
 #[inline]
-async fn send_response(stream: &mut TcpStream, payload: OpResponse) -> Result<(), Box<dyn Error>> {
-    let serialized = bitcode::encode(&payload);
-    let mut buf = Vec::with_capacity(8 + serialized.len());     // Write size and then the payload
-    buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&serialized);
-    stream.write_all(&buf).await?;
+async fn send_response(rdma: Arc<Rdma>, payload: OpResponse) -> Result<()> {
+    let encoded_payload = bitcode::encode(&payload);
+    
+    let layout = Layout::array::<u8>(encoded_payload.len())?;
+    let mut send_mr = rdma.alloc_local_mr(layout)?;
+
+    send_mr.as_mut_slice().copy_from_slice(&encoded_payload);
+
+    tracing::debug!("Sending response to client");
+    rdma.send(&send_mr).await?;
+    tracing::debug!("Response sent successfully");
 
     Ok(())
 }
 
-async fn handle_stream(device: String, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
-    tracing::debug!("Client connected");
+async fn handle_call(device: Arc<String>, rdma: Arc<Rdma>, mr: LocalMr) -> Result<()> {
+    let mut data = mr.as_slice();
 
-    loop {
-        let cap = stream.read_u64_le().await?;
-        let mut buf = vec![0u8; cap as usize];
-        stream.read_exact(&mut buf).await?;
-        let op: Op = bitcode::decode(&mut buf)?;
-
-        tracing::debug!("Decoded op from client");
+    let op = bitcode::decode(&mut data).unwrap();
+    
+    tracing::debug!("Decoded op from client");
 
 
-        // Should probably trim this down with a macro
-        match op {
-            Op::Write { inode, offset, data } => {
-                tracing::debug!("Write op from client");
-                let payload = handle_write(&device, inode, offset, data).await;
-                
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote write response to client");
-            },
-            Op::Read { inode, offset, size } => {
-                tracing::debug!("Read op from client");
-                let payload = handle_read(&device, inode, offset, size).await;
+    // Should probably trim this down with a macro
+    match op {
+        Op::Write { inode, offset, data } => {
+            tracing::debug!("Write op from client");
+            let payload = handle_write(&device, inode, offset, data).await;
+            
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote write response to client");
+        },
+        Op::Read { inode, offset, size } => {
+            tracing::debug!("Read op from client");
+            let payload = handle_read(&device, inode, offset, size).await;
 
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote read response to client");
-            },
-            Op::CreateEntry { inode, entry } => {
-                tracing::debug!("CreateEntry op from client");
-                let payload = handle_createentry(&device, inode, entry).await;
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote read response to client");
+        },
+        Op::CreateEntry { inode, entry } => {
+            tracing::debug!("CreateEntry op from client");
+            let payload = handle_createentry(&device, inode, entry).await;
 
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote CreateEntry response to client");
-            },
-            Op::DeleteEntry { inode, parent_inode } => {
-                tracing::debug!("DeleteEntry op from client");
-                let payload = handle_deleteentry(&device, parent_inode, inode).await;
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote CreateEntry response to client");
+        },
+        Op::DeleteEntry { inode, parent_inode } => {
+            tracing::debug!("DeleteEntry op from client");
+            let payload = handle_deleteentry(&device, parent_inode, inode).await;
 
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote DeleteEntry response to client");
-            },
-            Op::Create { inode, is_dir } => {
-                tracing::debug!("Create op from client");
-                let payload = handle_create(&device, inode, is_dir).await;
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote DeleteEntry response to client");
+        },
+        Op::Create { inode, is_dir } => {
+            tracing::debug!("Create op from client");
+            let payload = handle_create(&device, inode, is_dir).await;
 
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote create response to client");
-            },
-            Op::Delete { inode, is_dir } => {
-                tracing::debug!("Delete op from client");
-                let payload = handle_delete(&device, inode, is_dir).await;
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote create response to client");
+        },
+        Op::Delete { inode, is_dir } => {
+            tracing::debug!("Delete op from client");
+            let payload = handle_delete(&device, inode, is_dir).await;
 
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote delete response to client");
-            }
-            Op::GetSize { inode } => {
-                tracing::debug!("GetSize op from client");
-                let payload = handle_getsize(&device, inode).await;
-
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote getsize response to client");
-            }
-            Op::ListDirEntries { inode } => {
-                tracing::debug!("ListDirEntries op from client");
-                let payload = handle_listdirentries(&device, inode).await;
-
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote listdirentries response to client");
-            }
-            Op::GetNodeStats => {
-                tracing::debug!("GetNodeStats op from client");
-
-                let stats = fs2::statvfs(&device)?;
-
-                send_response(&mut stream, OpResponse::NodeStats(NodeInfo { total_size: stats.total_space(), free: stats.free_space() })).await?;
-                tracing::debug!("Wrote getnodestats response to client");
-            }
-            Op::Other(str) => {
-                tracing::info!("Other message from client: {}", str);
-                let payload = OpResponse::Error("hey man - storage server".to_string());
-
-                send_response(&mut stream, payload).await?;
-                tracing::debug!("Wrote payload response to client");
-            },
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote delete response to client");
         }
+        Op::GetSize { inode } => {
+            tracing::debug!("GetSize op from client");
+            let payload = handle_getsize(&device, inode).await;
 
-        
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote getsize response to client");
+        }
+        Op::ListDirEntries { inode } => {
+            tracing::debug!("ListDirEntries op from client");
+            let payload = handle_listdirentries(&device, inode).await;
+
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote listdirentries response to client");
+        }
+        Op::GetNodeStats => {
+            tracing::debug!("GetNodeStats op from client");
+
+            let stats = fs2::statvfs(&*device)?;
+
+            send_response(rdma, OpResponse::NodeStats(NodeInfo { total_size: stats.total_space(), free: stats.free_space() })).await?;
+            tracing::debug!("Wrote getnodestats response to client");
+        }
+        Op::Other(str) => {
+            tracing::info!("Other message from client: {}", str);
+            let payload = OpResponse::Error("hey man - storage server".to_string());
+
+            send_response(rdma, payload).await?;
+            tracing::debug!("Wrote payload response to client");
+        },
+    }
+    Ok(())
+}
+
+
+async fn handle_stream(device: Arc<String>, rdma: Arc<Rdma>) -> Result<()> {
+    
+    loop {
+        let mr = rdma.receive().await?;
+
+        handle_call(device.clone(), rdma.clone(), mr).await?;
     }
 
 }
@@ -377,7 +388,7 @@ async fn main() {
     let log_level = matches.value_of("log-level").unwrap();
 
 
-    let filter_string = format!("{},hyper=info", log_level);
+    let filter_string = format!("{},hyper=info,async_rdma=info", log_level);
 
     let filter = EnvFilter::try_new(filter_string).unwrap_or_else(|_| EnvFilter::new(log_level));
 
@@ -389,30 +400,24 @@ async fn main() {
     tracing::info!("Starting fdfs storage server");
     
 
-    let listener = TcpListener::bind(format!("{}:{}", listen_addr, port)).await.unwrap();
+    //let rdma = Arc::new(RdmaBuilder::default().set_max_message_length(1_000_000).listen(format!("{}:{}", listen_addr, port)).await.unwrap());
+    let rdma = Arc::new(RdmaListener::bind(format!("{}:{}", listen_addr, port)).await.unwrap().accept(1, 1, 64_000).await.unwrap());
 
-    let device = storage_dir.to_string();
+    let device = Arc::new(storage_dir.to_string());
 
-    loop {
-        let (stream, _) = listener.accept().await.unwrap();
-
-        let device_clone = device.clone();
-        tokio::spawn(async move {
-
-            match handle_stream(device_clone, stream).await {
-                Ok(()) => {},
-                Err(e) => {
-                    if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                        if io_err.kind() == ErrorKind::UnexpectedEof {
-                            tracing::warn!("Client disconnected unexpectedly");
-                            return;
-                        }
-                    }
-
-                    tracing::error!("Error handling client: {}", e);
+    match handle_stream(device, rdma).await {
+        Ok(()) => {},
+        Err(e) => {
+            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                if io_err.kind() == ErrorKind::UnexpectedEof {
+                    tracing::warn!("Client disconnected unexpectedly");
+                    return;
                 }
             }
-        });
+
+            tracing::error!("Error handling client: {}", e);
+        }
     }
+
 
 }

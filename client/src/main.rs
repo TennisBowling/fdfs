@@ -1,11 +1,10 @@
+use async_rdma::{LocalMr, LocalMrReadAccess, LocalMrWriteAccess, Rdma, RdmaBuilder};
 use gxhash::gxhash64;
 use shared::*;
-use std::{ffi::OsStr, num::NonZeroU32, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::atomic::AtomicUsize, time::{Duration, SystemTime}};
+use std::{alloc::Layout, ffi::OsStr, num::NonZeroU32, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, time::{Duration, SystemTime}};
 use anyhow::Result;
 use anyhow::anyhow;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     sync::Mutex,
 };
 use tracing_subscriber::EnvFilter;
@@ -19,56 +18,47 @@ use std::vec::IntoIter;
 
 const TTL: Duration = Duration::new(2, 0);
 
+
 #[inline]
 pub fn path_to_inode(path: &Path) -> Inode {
     Inode(gxhash64(path.as_os_str().as_bytes(), 17))
 }
 
 struct NodeConnectionManager {
-    pub streams: Vec<Mutex<(TcpStream, Vec<u8>)>>,
-    pub current: AtomicUsize,
+    pub rdma: Rdma,
     pub addr: String,
 }
 
 impl NodeConnectionManager {
     async fn new(
         addr: String,
-        num_connections: u32,
     ) -> Result<NodeConnectionManager> {
-        let mut streams = Vec::with_capacity(num_connections as usize);
+        let rdma = Rdma::connect(addr.clone(), 1, 1, 64_000).await?;
 
-        for _ in 0..num_connections {
-            let stream = TcpStream::connect(addr.clone()).await?;
-            stream.set_nodelay(true)?; // Disable nagle, do not buffer
-            streams.push(Mutex::new((stream, Vec::with_capacity(1000000)))); // 1MB buffer
-        }
 
         tracing::debug!("Setup connection maanger for node {}", addr);
         Ok(NodeConnectionManager {
-            streams,
-            current: AtomicUsize::new(0),
+            rdma,
             addr,
         })
     }
 
     async fn send_request(&self, payload: Op) -> Result<OpResponse> {
-        let stream_id = self
-            .current
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.streams.len();
-        let mut stream_buf = self.streams.get(stream_id).unwrap().lock().await;
-        let (stream, buf) = &mut *stream_buf;
+        let encoded_payload = bitcode::encode(&payload);
 
-        let serialized = bitcode::encode(&payload);
-        buf.clear(); // Reuse buffer
-        buf.extend_from_slice(&(serialized.len() as u64).to_le_bytes()); // Write size and then the payload
-        buf.extend_from_slice(&serialized);
-        stream.write_all(&buf).await?;
+        let layout = Layout::array::<u8>(encoded_payload.len())?;
+        let mut send_mr = self.rdma.alloc_local_mr(layout)?;
+
+        // Copy encoded data (no padding, no zeros)
+        send_mr.as_mut_slice().copy_from_slice(&encoded_payload);
+
+        self.rdma.send(&send_mr).await?;     // Send
         tracing::debug!("Wrote payload to {}", self.addr);
 
-        let cap = stream.read_u64_le().await?;
-        let mut buf = vec![0u8; cap as usize];
-        stream.read_exact(&mut buf).await?;
+
+        let receive_mr = self.rdma.receive().await?;
+        let buf = receive_mr.as_slice();
+
         let deserialized: OpResponse = bitcode::decode(&buf)?;
 
         Ok(deserialized)
@@ -329,7 +319,7 @@ impl NodeManager {
     async fn new(nodes_strings: Vec<String>) -> Result<NodeManager> {
         let mut nodes = Vec::with_capacity(nodes_strings.len());
         for node in nodes_strings {
-            nodes.push(NodeConnectionManager::new(node, 5).await?); // 100 max connections
+            nodes.push(NodeConnectionManager::new(node).await?); // 100 max connections
         }
 
         Ok(NodeManager { nodes })
@@ -553,7 +543,7 @@ async fn main() {
     let nodes = matches.value_of("nodes").unwrap();
     let nodes = nodes.split(',').collect::<Vec<&str>>().iter().map(|x| x.to_string()).collect();
 
-    let filter_string = format!("{},hyper=info,fuse3=info", log_level);
+    let filter_string = format!("{},hyper=info,fuse3=info,async_rdma=info", log_level);
 
     let filter = EnvFilter::try_new(filter_string).unwrap_or_else(|_| EnvFilter::new(log_level));
 
@@ -570,6 +560,7 @@ async fn main() {
 
     // Create special root directory
     manager.create_special().await.unwrap();
+
 
     // Take a look at write back cache
     let options = MountOptions::default().fs_name("fdfs").force_readdir_plus(true).custom_options("noatime").custom_options("nosuid").custom_options("nodev").custom_options("async").to_owned();

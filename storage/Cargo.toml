@@ -12,3 +12,4 @@ bitcode = { workspace = true }
 clap = { workspace = true }
 fs2 = "0.4.3"
 async-rdma = { workspace = true }
+anyhow = { workspace = true }

@@ -1271,6 +1271,7 @@ dependencies = [
 name = "storage"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-rdma",
  "bitcode",
  "clap",
