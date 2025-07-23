@@ -242,6 +242,7 @@ async fn send_response(rdma: Arc<Rdma>, payload: OpResponse) -> Result<()> {
 }
 
 async fn handle_call(device: Arc<String>, rdma: Arc<Rdma>, mr: LocalMr) -> Result<()> {
+    // Rdma should be reusing buffers for efficiency
     let mut data = mr.as_slice();
 
     let op = bitcode::decode(&mut data).unwrap();
