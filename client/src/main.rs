@@ -38,7 +38,8 @@ impl NodeConnectionManager {
     ) -> Result<NodeConnectionManager> {
         let mut streams = Vec::with_capacity(num_connections as usize);
 
-        for _ in 0..num_connections {
+        for i in 0..num_connections {
+            tracing::debug!("Created stream number {} for {}", i, addr);
             streams.push(Rdma::connect(addr.clone(), 1, 1, 64_000).await?);
         }
 
@@ -334,7 +335,7 @@ impl NodeManager {
     async fn new(nodes_strings: Vec<String>) -> Result<NodeManager> {
         let mut nodes = Vec::with_capacity(nodes_strings.len());
         for node in nodes_strings {
-            nodes.push(NodeConnectionManager::new(node, 30)); // 30 max connections
+            nodes.push(NodeConnectionManager::new(node, 5)); // 30 max connections
         }
 
         let nodes = join_all(nodes).await.into_iter().collect::<Result<Vec<_>, _>>()?;

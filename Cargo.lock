@@ -76,6 +76,7 @@ dependencies = [
 [[package]]
 name = "async-rdma"
 version = "0.5.0"
+source = "git+https://github.com/tennisbowling/async-rdma#4c3c1b697c7c8879d927ecce89189f6d6cf34e61"
 dependencies = [
  "async-bincode",
  "async-trait",
