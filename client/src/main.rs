@@ -1,7 +1,7 @@
 use async_rdma::{LocalMr, LocalMrReadAccess, LocalMrWriteAccess, Rdma, RdmaBuilder};
 use gxhash::gxhash64;
 use shared::*;
-use std::{alloc::Layout, ffi::OsStr, num::NonZeroU32, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, time::{Duration, SystemTime}};
+use std::{alloc::Layout, ffi::OsStr, num::NonZeroU32, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::atomic::AtomicUsize, time::{Duration, SystemTime}};
 use anyhow::Result;
 use anyhow::anyhow;
 use tokio::{
@@ -25,38 +25,54 @@ pub fn path_to_inode(path: &Path) -> Inode {
 }
 
 struct NodeConnectionManager {
-    pub rdma: Rdma,
+    pub streams: Vec<Rdma>,
+    pub current: AtomicUsize,
     pub addr: String,
 }
+
 
 impl NodeConnectionManager {
     async fn new(
         addr: String,
+        num_connections: u32,
     ) -> Result<NodeConnectionManager> {
-        let rdma = Rdma::connect(addr.clone(), 1, 1, 64_000).await?;
+        let mut streams = Vec::with_capacity(num_connections as usize);
+
+        for _ in 0..num_connections {
+            tracing::info!("conencting 1");
+            streams.push(Rdma::connect(addr.clone(), 1, 1, 64_000).await?)
+        }
 
 
         tracing::debug!("Setup connection maanger for node {}", addr);
         Ok(NodeConnectionManager {
-            rdma,
+            streams,
+            current: AtomicUsize::new(0),
             addr,
         })
     }
 
     async fn send_request(&self, payload: Op) -> Result<OpResponse> {
+        let stream_id = self
+            .current
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.streams.len();
+
+        let rdma = self.streams.get(stream_id).unwrap();
+
         let encoded_payload = bitcode::encode(&payload);
 
         let layout = Layout::array::<u8>(encoded_payload.len())?;
-        let mut send_mr = self.rdma.alloc_local_mr(layout)?;
+        let mut send_mr = rdma.alloc_local_mr(layout)?;
 
         // Copy encoded data (no padding, no zeros)
         send_mr.as_mut_slice().copy_from_slice(&encoded_payload);
 
-        self.rdma.send(&send_mr).await?;     // Send
+        rdma.send(&send_mr).await?;     // Send
         tracing::debug!("Wrote payload to {}", self.addr);
 
 
-        let receive_mr = self.rdma.receive().await?;
+        let receive_mr = rdma.receive().await?;
         let buf = receive_mr.as_slice();
 
         let deserialized: OpResponse = bitcode::decode(&buf)?;
@@ -319,7 +335,7 @@ impl NodeManager {
     async fn new(nodes_strings: Vec<String>) -> Result<NodeManager> {
         let mut nodes = Vec::with_capacity(nodes_strings.len());
         for node in nodes_strings {
-            nodes.push(NodeConnectionManager::new(node).await?); // 100 max connections
+            nodes.push(NodeConnectionManager::new(node, 30).await?); // 30 max connections
         }
 
         Ok(NodeManager { nodes })
@@ -568,5 +584,6 @@ async fn main() {
 
     tokio::signal::ctrl_c().await.unwrap();
     handle.unmount().await.unwrap();
+
 
 }
