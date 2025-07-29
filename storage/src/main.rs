@@ -403,23 +403,30 @@ async fn main() {
     
 
     //let rdma = Arc::new(RdmaBuilder::default().set_max_message_length(1_000_000).listen(format!("{}:{}", listen_addr, port)).await.unwrap());
-    let rdma = Arc::new(RdmaListener::bind(format!("{}:{}", listen_addr, port)).await.unwrap().accept(1, 1, 64_000).await.unwrap());
+    
 
     let device = Arc::new(storage_dir.to_string());
 
-    match handle_stream(device, rdma).await {
-        Ok(()) => {},
-        Err(e) => {
-            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                if io_err.kind() == ErrorKind::UnexpectedEof {
-                    tracing::warn!("Client disconnected unexpectedly");
-                    return;
-                }
-            }
+    loop {
+        let rdma = Arc::new(RdmaListener::bind(format!("{}:{}", listen_addr, port)).await.unwrap().accept(1, 1, 64_000).await.unwrap());
 
-            tracing::error!("Error handling client: {}", e);
-        }
+        let device_clone = device.clone();
+        tokio::spawn(async move {
+            match handle_stream(device_clone, rdma).await {
+            Ok(()) => {},
+            Err(e) => {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    if io_err.kind() == ErrorKind::UnexpectedEof {
+                        tracing::warn!("Client disconnected unexpectedly");
+                        return;
+                    }
+                }
+
+                tracing::error!("Error handling client: {}", e);
+            }
+        }});
     }
+    
 
 
 }

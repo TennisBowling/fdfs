@@ -39,12 +39,10 @@ impl NodeConnectionManager {
         let mut streams = Vec::with_capacity(num_connections as usize);
 
         for _ in 0..num_connections {
-            tracing::info!("conencting 1");
-            streams.push(Rdma::connect(addr.clone(), 1, 1, 64_000).await?)
+            streams.push(Rdma::connect(addr.clone(), 1, 1, 64_000).await?);
         }
 
-
-        tracing::debug!("Setup connection maanger for node {}", addr);
+        tracing::info!("Setup connection maanger for node {}", addr);
         Ok(NodeConnectionManager {
             streams,
             current: AtomicUsize::new(0),
@@ -58,6 +56,7 @@ impl NodeConnectionManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % self.streams.len();
 
+        tracing::debug!("using id {}", stream_id);
         let rdma = self.streams.get(stream_id).unwrap();
 
         let encoded_payload = bitcode::encode(&payload);
@@ -335,8 +334,11 @@ impl NodeManager {
     async fn new(nodes_strings: Vec<String>) -> Result<NodeManager> {
         let mut nodes = Vec::with_capacity(nodes_strings.len());
         for node in nodes_strings {
-            nodes.push(NodeConnectionManager::new(node, 30).await?); // 30 max connections
+            nodes.push(NodeConnectionManager::new(node, 30)); // 30 max connections
         }
+
+        let nodes = join_all(nodes).await.into_iter().collect::<Result<Vec<_>, _>>()?;
+
 
         Ok(NodeManager { nodes })
     }
